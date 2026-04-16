@@ -13,7 +13,7 @@ import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Label } from '@/components/ui/label';
-import { Upload, BarChart3, FileSpreadsheet, CheckCircle2, XCircle, Loader2, Download, UserX, Users, UserCheck, Eye, Trash2, Edit, Search, X, Pencil } from 'lucide-react';
+import { Upload, BarChart3, FileSpreadsheet, CheckCircle2, XCircle, Loader2, Download, UserX, Users, UserCheck, Eye, Trash2, Edit, Search, X, Pencil, LogOut } from 'lucide-react';
 import { compareGradeLabels } from '@/lib/class-grade';
 import { compareSchoolYearLabels, groupClassesBySchoolYearAndGrade } from '@/lib/class-org';
 
@@ -155,7 +155,28 @@ interface EditedStudent {
   is_half_free: boolean;
 }
 
+interface AuthUser {
+  id: string;
+  account?: string;
+  email?: string;
+  role?: 'admin' | 'assistant';
+}
+
 export default function Home() {
+  const [authChecking, setAuthChecking] = useState(true);
+  const [authUser, setAuthUser] = useState<AuthUser | null>(null);
+  const [authMode, setAuthMode] = useState<'login' | 'register' | 'forgot'>('login');
+  const [authSubmitting, setAuthSubmitting] = useState(false);
+  const [authEmail, setAuthEmail] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
+  const [registerRole, setRegisterRole] = useState<'admin' | 'assistant'>('assistant');
+  const [showChangePassword, setShowChangePassword] = useState(false);
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [showCreateAssistant, setShowCreateAssistant] = useState(false);
+  const [assistantEmail, setAssistantEmail] = useState('');
+  const [assistantPassword, setAssistantPassword] = useState('');
+
   const [activeTab, setActiveTab] = useState('upload');
   const [classes, setClasses] = useState<ClassInfo[]>([]);
   const [loading, setLoading] = useState(false);
@@ -207,9 +228,26 @@ export default function Home() {
   const [editClassLessons, setEditClassLessons] = useState('');
   const [savingClass, setSavingClass] = useState(false);
 
-  // 未知班级列表
   useEffect(() => {
-    fetchClasses();
+    const checkAuth = async () => {
+      setAuthChecking(true);
+      try {
+        const res = await fetch('/api/auth/me');
+        const data = await res.json();
+        if (res.ok && data.authenticated) {
+          setAuthUser(data.user);
+          await fetchClasses();
+        } else {
+          setAuthUser(null);
+        }
+      } catch (error) {
+        console.error('获取登录状态失败', error);
+        setAuthUser(null);
+      } finally {
+        setAuthChecking(false);
+      }
+    };
+    void checkAuth();
   }, []);
 
   useEffect(() => {
@@ -316,6 +354,11 @@ export default function Home() {
     try {
       const res = await fetch('/api/roster');
       const data = await res.json();
+      if (res.status === 401) {
+        setAuthUser(null);
+        setMessage({ type: 'error', text: '登录已过期，请重新登录' });
+        return;
+      }
       if (data.data) {
         setClasses(data.data);
       }
@@ -323,6 +366,148 @@ export default function Home() {
       console.error('未知班级列表失败:', error);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleAuthSubmit = async () => {
+    if (authMode === 'forgot') {
+      await handleForgotPassword();
+      return;
+    }
+    if (!authEmail.trim() || !authPassword.trim()) {
+      setMessage({ type: 'error', text: '请输入账号和密码' });
+      return;
+    }
+    setAuthSubmitting(true);
+    setMessage(null);
+    try {
+      const endpoint = authMode === 'login' ? '/api/auth/login' : '/api/auth/register';
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          account: authEmail.trim(),
+          password: authPassword,
+          role: authMode === 'register' ? registerRole : undefined,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setMessage({ type: 'error', text: data.error || '登录失败' });
+        return;
+      }
+
+      if (data.needs_email_confirm) {
+        setMessage({ type: 'success', text: data.message || '注册成功，请先验证邮箱后再登录。' });
+        setAuthMode('login');
+        return;
+      }
+
+      setAuthUser(data.user);
+      setMessage({ type: 'success', text: authMode === 'login' ? '登录成功' : '注册并登录成功' });
+      setAuthPassword('');
+      await fetchClasses();
+    } catch (error: unknown) {
+      setMessage({ type: 'error', text: clientErrorToZhMessage(error, '登录失败') });
+    } finally {
+      setAuthSubmitting(false);
+    }
+  };
+
+  const handleForgotPassword = async () => {
+    if (!authEmail.trim()) {
+      setMessage({ type: 'error', text: '请输入注册邮箱（账号用户请联系管理员）' });
+      return;
+    }
+    setAuthSubmitting(true);
+    setMessage(null);
+    try {
+      const res = await fetch('/api/auth/forgot-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ account: authEmail.trim() }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setMessage({ type: 'error', text: data.error || '发送失败' });
+        return;
+      }
+      setMessage({ type: 'success', text: data.message || '重置邮件已发送，请查收邮箱。' });
+      setAuthMode('login');
+    } catch (error: unknown) {
+      setMessage({ type: 'error', text: clientErrorToZhMessage(error, '发送失败') });
+    } finally {
+      setAuthSubmitting(false);
+    }
+  };
+
+  const handleChangePassword = async () => {
+    if (!currentPassword.trim() || !newPassword.trim()) {
+      setMessage({ type: 'error', text: '请输入当前密码和新密码' });
+      return;
+    }
+    setAuthSubmitting(true);
+    setMessage(null);
+    try {
+      const res = await fetch('/api/auth/change-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ currentPassword, newPassword }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setMessage({ type: 'error', text: data.error || '修改密码失败' });
+        return;
+      }
+      setMessage({ type: 'success', text: data.message || '密码修改成功' });
+      setCurrentPassword('');
+      setNewPassword('');
+      setShowChangePassword(false);
+    } catch (error: unknown) {
+      setMessage({ type: 'error', text: clientErrorToZhMessage(error, '修改密码失败') });
+    } finally {
+      setAuthSubmitting(false);
+    }
+  };
+
+  const handleCreateAssistant = async () => {
+    if (!assistantEmail.trim() || !assistantPassword.trim()) {
+      setMessage({ type: 'error', text: '请输入助教账号和密码' });
+      return;
+    }
+    setAuthSubmitting(true);
+    setMessage(null);
+    try {
+      const res = await fetch('/api/auth/create-assistant', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ account: assistantEmail.trim(), password: assistantPassword }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setMessage({ type: 'error', text: data.error || '创建助教账号失败' });
+        return;
+      }
+      setMessage({ type: 'success', text: `已创建助教账号：${data.user?.account || assistantEmail.trim()}` });
+      setAssistantEmail('');
+      setAssistantPassword('');
+      setShowCreateAssistant(false);
+    } catch (error: unknown) {
+      setMessage({ type: 'error', text: clientErrorToZhMessage(error, '创建助教账号失败') });
+    } finally {
+      setAuthSubmitting(false);
+    }
+  };
+
+  const handleLogout = async () => {
+    try {
+      await fetch('/api/auth/logout', { method: 'POST' });
+    } finally {
+      setAuthUser(null);
+      setClasses([]);
+      setResult(null);
+      setSimilarNames(null);
+      setMessage({ type: 'success', text: '已退出登录' });
     }
   };
 
@@ -954,17 +1139,151 @@ export default function Home() {
     URL.revokeObjectURL(url);
   };
 
+  if (authChecking) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-orange-50 via-amber-50 to-orange-100 dark:from-orange-950 dark:via-amber-950 dark:to-orange-900">
+        <div className="flex items-center gap-2 text-slate-600">
+          <Loader2 className="h-5 w-5 animate-spin" />
+          正在验证登录状态...
+        </div>
+      </div>
+    );
+  }
+
+  if (!authUser) {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-orange-50 via-amber-50 to-orange-100 dark:from-orange-950 dark:via-amber-950 dark:to-orange-900 flex items-center justify-center p-4">
+        <Card className="w-full max-w-md">
+          <CardHeader>
+            <CardTitle className="text-blue-600">续班率统计系统登录</CardTitle>
+            <CardDescription>
+              请先登录后再使用班级管理与续班率统计功能。
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            {message && (
+              <Alert className={message.type === 'success' ? 'border-green-500 bg-green-50' : 'border-red-500 bg-red-50'}>
+                <AlertDescription>{message.text}</AlertDescription>
+              </Alert>
+            )}
+            <div className="space-y-2">
+              <Label>账号</Label>
+              <Input
+                type="text"
+                placeholder="请输入账号（旧用户也可输入邮箱）"
+                value={authEmail}
+                onChange={(e) => setAuthEmail(e.target.value)}
+              />
+            </div>
+            {authMode !== 'forgot' && (
+              <div className="space-y-2">
+                <Label>密码</Label>
+                <Input
+                  type="password"
+                  placeholder="请输入密码"
+                  value={authPassword}
+                  onChange={(e) => setAuthPassword(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && !authSubmitting) void handleAuthSubmit();
+                  }}
+                />
+              </div>
+            )}
+            {authMode === 'register' && (
+              <div className="space-y-2">
+                <Label>角色</Label>
+                <Select value={registerRole} onValueChange={(v: 'admin' | 'assistant') => setRegisterRole(v)}>
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="admin">管理员</SelectItem>
+                    <SelectItem value="assistant">助教</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            )}
+            <Button className="w-full" onClick={() => void handleAuthSubmit()} disabled={authSubmitting}>
+              {authSubmitting ? '提交中...' : authMode === 'login' ? '登录' : authMode === 'register' ? '注册并登录' : '发送重置邮件'}
+            </Button>
+            <div className="grid grid-cols-3 gap-2">
+              <Button variant={authMode === 'login' ? 'default' : 'outline'} onClick={() => setAuthMode('login')} disabled={authSubmitting}>
+                登录
+              </Button>
+              <Button variant={authMode === 'register' ? 'default' : 'outline'} onClick={() => setAuthMode('register')} disabled={authSubmitting}>
+                注册
+              </Button>
+              <Button variant={authMode === 'forgot' ? 'default' : 'outline'} onClick={() => setAuthMode('forgot')} disabled={authSubmitting}>
+                忘记密码
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen bg-gradient-to-br from-orange-50 via-amber-50 to-orange-100 dark:from-orange-950 dark:via-amber-950 dark:to-orange-900">
       <div className="container mx-auto px-4 py-8 max-w-6xl">
         {/* 标题 */}
-        <div className="text-center mb-8">
-          <h1 className="text-3xl font-bold text-blue-600 dark:text-blue-400 mb-2">
-            续班率统计系统
-          </h1>
-          <p className="text-blue-500 dark:text-blue-500">
-            按学年、年级组织班级，上传点名册并计算续班率，支持排除半免和上课不足学生。
-          </p>
+        <div className="mb-8">
+          <div className="flex items-start justify-between gap-4">
+            <div className="text-center flex-1">
+              <h1 className="text-3xl font-bold text-blue-600 dark:text-blue-400 mb-2">
+                续班率统计系统
+              </h1>
+              <p className="text-blue-500 dark:text-blue-500">
+                按学年、年级组织班级，上传点名册并计算续班率，支持排除半免和上课不足学生。
+              </p>
+              <p className="text-xs text-slate-500 mt-2">
+                当前登录：{authUser.account || authUser.email || authUser.id}
+                {authUser.role ? `（${authUser.role === 'admin' ? '管理员' : '助教'}）` : ''}
+              </p>
+            </div>
+            <div className="flex flex-col gap-2 shrink-0">
+              {authUser.role === 'admin' && (
+                <Button variant="outline" onClick={() => setShowCreateAssistant((v) => !v)} className="shrink-0">
+                  添加助教
+                </Button>
+              )}
+              <Button variant="outline" onClick={() => setShowChangePassword((v) => !v)} className="shrink-0">
+                修改密码
+              </Button>
+              <Button variant="outline" onClick={() => void handleLogout()} className="shrink-0">
+                <LogOut className="h-4 w-4 mr-2" />
+                退出登录
+              </Button>
+            </div>
+          </div>
+          {showChangePassword && (
+            <Card className="mt-4 max-w-md ml-auto">
+              <CardHeader className="pb-3">
+                <CardTitle className="text-base">修改密码</CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                <Input type="password" placeholder="当前密码" value={currentPassword} onChange={(e) => setCurrentPassword(e.target.value)} />
+                <Input type="password" placeholder="新密码（至少6位）" value={newPassword} onChange={(e) => setNewPassword(e.target.value)} />
+                <Button onClick={() => void handleChangePassword()} disabled={authSubmitting} className="w-full">
+                  {authSubmitting ? '提交中...' : '确认修改'}
+                </Button>
+              </CardContent>
+            </Card>
+          )}
+          {authUser.role === 'admin' && showCreateAssistant && (
+            <Card className="mt-4 max-w-md ml-auto">
+              <CardHeader className="pb-3">
+                <CardTitle className="text-base">管理员添加助教账号</CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                <Input type="text" placeholder="助教账号（英文/数字）" value={assistantEmail} onChange={(e) => setAssistantEmail(e.target.value)} />
+                <Input type="password" placeholder="助教初始密码（至少6位）" value={assistantPassword} onChange={(e) => setAssistantPassword(e.target.value)} />
+                <Button onClick={() => void handleCreateAssistant()} disabled={authSubmitting} className="w-full">
+                  {authSubmitting ? '提交中...' : '创建助教账号'}
+                </Button>
+              </CardContent>
+            </Card>
+          )}
         </div>
 
         {/* 消息提示 */}

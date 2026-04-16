@@ -12,6 +12,7 @@ export const classes = pgTable(
 	"classes",
 	{
 		id: varchar("id", { length: 36 }).primaryKey().default(sql`gen_random_uuid()`),
+		user_id: varchar("user_id", { length: 36 }).notNull(),
 		name: varchar("name", { length: 255 }).notNull(), // 班级名称，如"寒假一班"
 		term: varchar("term", { length: 50 }).notNull(), // 学期，如"寒假"、"春季"
 		total_lessons: integer("total_lessons").notNull().default(12), // 总课时数
@@ -19,6 +20,7 @@ export const classes = pgTable(
 	},
 	(table) => [
 		index("classes_term_idx").on(table.term), // 按学期索引
+		index("classes_user_idx").on(table.user_id),
 	]
 );
 

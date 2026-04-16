@@ -78,6 +78,7 @@ export async function POST(request: NextRequest) {
       const { data: newClass, error: classError } = await supabase
         .from('classes')
         .insert({
+          user_id: 'shared',
           name: className,
           term: term,
           total_lessons: totalLessons,
