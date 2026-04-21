@@ -16,14 +16,17 @@ import { Label } from '@/components/ui/label';
 import { Upload, BarChart3, FileSpreadsheet, CheckCircle2, XCircle, Loader2, Download, UserX, Users, UserCheck, Eye, Trash2, Edit, Search, X, Pencil, LogOut } from 'lucide-react';
 import { compareGradeLabels, extractGradeFromClassName } from '@/lib/class-grade';
 import { compareSchoolYearLabels, groupClassesBySchoolYearAndGrade } from '@/lib/class-org';
+import * as XLSX from 'xlsx';
 
 /** 上传「学年/届次」输入框的下拉建议（可与已有数据合并） */
 const SCHOOL_TERM_SUGGESTIONS = [
   '25秋',
   '25寒',
+  '26暑',
   '26春',
   '26秋',
   '26寒',
+  '27暑',
   '27春',
 ];
 
@@ -66,7 +69,7 @@ function isValidTermFormat(term: string): boolean {
 }
 
 type SeasonTag = 'spring' | 'autumn' | 'winter' | 'summer' | 'unknown';
-type StatPlan = 'autumn_to_spring' | 'winter_to_spring' | 'autumn_winter_to_spring';
+type StatPlan = 'autumn_to_spring' | 'winter_to_spring' | 'autumn_winter_to_spring' | 'summer_to_autumn';
 
 function detectSeasonTag(term: string): SeasonTag {
   if (term.includes('春')) return 'spring';
@@ -181,6 +184,7 @@ interface ClassDetail {
   is_half_free: boolean;
   is_excluded: boolean;
   remark: string;
+  original_remark?: string;
 }
 
 interface ClassWithStudents {
@@ -198,6 +202,22 @@ interface EditedStudent {
   record_id: string;
   lessons_attended: number;
   is_half_free: boolean;
+}
+
+interface UploadPreviewRow {
+  name: string;
+  lessons_attended: number;
+  exclude_label: 'free' | 'half_free' | 'withdraw' | 'low_attendance' | null;
+  display_remark: string;
+}
+
+interface UploadPreviewData {
+  rows: UploadPreviewRow[];
+  total_students: number;
+  free_count: number;
+  half_free_count: number;
+  withdraw_count: number;
+  low_attendance_count: number;
 }
 
 interface AuthUser {
@@ -233,6 +253,9 @@ export default function Home() {
   const [term, setTerm] = useState('');
   const [totalLessons, setTotalLessons] = useState('12');
   const [uploading, setUploading] = useState(false);
+  const [parsingPreview, setParsingPreview] = useState(false);
+  const [uploadPreview, setUploadPreview] = useState<UploadPreviewData | null>(null);
+  const [showAllUploadPreviewRows, setShowAllUploadPreviewRows] = useState(false);
 
   // 统计表单
   const [fromTerm, setFromTerm] = useState('');
@@ -273,7 +296,7 @@ export default function Home() {
   const [editingStudentId, setEditingStudentId] = useState<string | null>(null);
   const [editedStudent, setEditedStudent] = useState<EditedStudent | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
-  const [studentFilter, setStudentFilter] = useState<'all' | 'normal' | 'excluded'>('all');
+  const [studentFilter, setStudentFilter] = useState<'all' | 'normal' | 'excluded' | 'free' | 'half_free' | 'withdraw' | 'low_attendance'>('all');
   const [lessonDrafts, setLessonDrafts] = useState<Record<string, string>>({});
   const [batchLessonInput, setBatchLessonInput] = useState('');
   const [batchApplying, setBatchApplying] = useState(false);
@@ -723,6 +746,7 @@ export default function Home() {
       const matchSourceSeason = (season: SeasonTag) => {
         if (plan === 'autumn_to_spring') return season === 'autumn';
         if (plan === 'winter_to_spring') return season === 'winter';
+        if (plan === 'summer_to_autumn') return season === 'summer';
         return season === 'autumn' || season === 'winter';
       };
       const sourceClasses = classes.filter((c) => {
@@ -735,8 +759,11 @@ export default function Home() {
       const targetClasses = classes.filter((c) => {
         const y = extractYearTokenFromText(`${c.term} ${c.name}`);
         const s = detectSeasonTag(`${c.term} ${c.name}`);
-        if (s !== 'spring') return false;
-        return y === statYear || y === nextYear || y === null;
+        const isTargetSeason = plan === 'summer_to_autumn' ? s === 'autumn' : s === 'spring';
+        if (!isTargetSeason) return false;
+        return plan === 'summer_to_autumn'
+          ? y === statYear || y === null
+          : y === statYear || y === nextYear || y === null;
       });
       const fromTerms = [...new Set(sourceClasses.map((c) => c.term))];
       const toTerms = [...new Set(targetClasses.map((c) => c.term))];
@@ -788,6 +815,137 @@ export default function Home() {
     }
   }, [matchFromTerm, existingTerms, matchToTerm]);
 
+  const buildUploadPreview = useCallback((data: (string | number | boolean | null)[][], totalLessonsInput: number): UploadPreviewData => {
+    const headers = data[0] || [];
+    let nameIndex = -1;
+    let lessonsIndex = -1;
+    let remarkIndex = -1;
+    let halfFreeIndex = -1;
+
+    headers.forEach((header, index) => {
+      const headerStr = String(header || '').toLowerCase().trim();
+      if (headerStr.includes('姓名') || headerStr.includes('名字') || headerStr === 'name') {
+        nameIndex = index;
+      } else if (
+        headerStr.includes('课时') ||
+        headerStr.includes('上课') ||
+        headerStr.includes('出勤') ||
+        headerStr.includes('lessons')
+      ) {
+        lessonsIndex = index;
+      } else if (headerStr.includes('备注') || headerStr.includes('remark') || headerStr.includes('note') || headerStr.includes('说明')) {
+        remarkIndex = index;
+      } else if (headerStr.includes('半免') || headerStr.includes('优惠') || headerStr.includes('折扣') || headerStr.includes('half')) {
+        halfFreeIndex = index;
+      }
+    });
+
+    if (nameIndex === -1) nameIndex = 0;
+    if (lessonsIndex === -1) lessonsIndex = 1;
+
+    const freeKeywords = ['免费', '全免', '免学费'];
+    const halfFreeKeywords = ['半免', '优惠', '折扣', 'half'];
+    const withdrawKeywords = ['退费', '试听', '休学', '退学', '退款', '取消', '退班', '退'];
+    const rows: UploadPreviewRow[] = [];
+    const oneThird = Math.ceil(Math.max(1, totalLessonsInput) / 3);
+    for (let i = 1; i < data.length; i++) {
+      const row = data[i];
+      if (!row || row.length === 0) continue;
+      const name = String(row[nameIndex] || '').trim();
+      if (!name) continue;
+
+      let lessonsAttended = 0;
+      const lessonsValue = row[lessonsIndex];
+      if (typeof lessonsValue === 'number') lessonsAttended = lessonsValue;
+      else if (typeof lessonsValue === 'string') lessonsAttended = parseInt(lessonsValue, 10) || 0;
+
+      const remarkValue = remarkIndex >= 0 && remarkIndex < row.length ? String(row[remarkIndex] || '').trim() : '';
+      const halfFreeValue = halfFreeIndex >= 0 && halfFreeIndex < row.length ? String(row[halfFreeIndex] || '').trim() : '';
+      const text = `${remarkValue} ${halfFreeValue}`.toLowerCase();
+
+      const isWithdraw = withdrawKeywords.some((k) => text.includes(k.toLowerCase()));
+      const isFree = freeKeywords.some((k) => text.includes(k.toLowerCase()));
+      const isHalf = halfFreeKeywords.some((k) => text.includes(k.toLowerCase()));
+      let excludeLabel: UploadPreviewRow['exclude_label'] = null;
+      let displayRemark = remarkValue || '';
+      if (isWithdraw) {
+        excludeLabel = 'withdraw';
+        displayRemark = '退费/退班';
+        lessonsAttended = 0;
+      } else if (isFree) {
+        excludeLabel = 'free';
+        displayRemark = '免费';
+      } else if (isHalf) {
+        excludeLabel = 'half_free';
+        displayRemark = '半免';
+      } else if (lessonsAttended < oneThird) {
+        excludeLabel = 'low_attendance';
+        displayRemark = '课时不足';
+      }
+
+      rows.push({
+        name,
+        lessons_attended: lessonsAttended,
+        exclude_label: excludeLabel,
+        display_remark: displayRemark,
+      });
+    }
+
+    return {
+      rows,
+      total_students: rows.length,
+      free_count: rows.filter((r) => r.exclude_label === 'free').length,
+      half_free_count: rows.filter((r) => r.exclude_label === 'half_free').length,
+      withdraw_count: rows.filter((r) => r.exclude_label === 'withdraw').length,
+      low_attendance_count: rows.filter((r) => r.exclude_label === 'low_attendance').length,
+    };
+  }, []);
+
+  const parseUploadPreview = useCallback(async (nextFile: File) => {
+    setParsingPreview(true);
+    try {
+      const totalLessonsNum = Math.max(1, parseInt(totalLessons, 10) || 12);
+      const buffer = await nextFile.arrayBuffer();
+      const workbook = XLSX.read(new Uint8Array(buffer), { type: 'array' });
+      const sheetName = workbook.SheetNames[0];
+      if (!sheetName) {
+        setUploadPreview(null);
+        setMessage({ type: 'error', text: '点名文件内容为空，请检查文件后重试' });
+        return;
+      }
+      const worksheet = workbook.Sheets[sheetName];
+      const jsonData = XLSX.utils.sheet_to_json(worksheet, { header: 1 }) as (string | number | boolean | null)[][];
+      setUploadPreview(buildUploadPreview(jsonData, totalLessonsNum));
+    } catch (error: unknown) {
+      setUploadPreview(null);
+      setMessage({ type: 'error', text: clientErrorToZhMessage(error, '解析文件失败，请确认文件格式正确') });
+    } finally {
+      setParsingPreview(false);
+    }
+  }, [buildUploadPreview, totalLessons]);
+
+  const handleChooseUploadFile = useCallback((nextFile: File | null) => {
+    if (!nextFile) {
+      setFile(null);
+      setUploadPreview(null);
+      setShowAllUploadPreviewRows(false);
+      return;
+    }
+    const lower = nextFile.name.toLowerCase();
+    if (!lower.endsWith('.xlsx') && !lower.endsWith('.xls') && !lower.endsWith('.csv')) {
+      setMessage({ type: 'error', text: '请上传 Excel（.xlsx / .xls）或 CSV 文件' });
+      return;
+    }
+    setFile(nextFile);
+    setShowAllUploadPreviewRows(false);
+    void parseUploadPreview(nextFile);
+  }, [parseUploadPreview]);
+
+  useEffect(() => {
+    if (!file) return;
+    void parseUploadPreview(file);
+  }, [file, parseUploadPreview, totalLessons]);
+
   // 上传点名册
   const handleUpload = async () => {
     if (!file || !className || !term) {
@@ -795,7 +953,7 @@ export default function Home() {
       return;
     }
     if (!isValidTermFormat(term)) {
-      setMessage({ type: 'error', text: '学年/届次格式不正确，请使用如：25秋、25寒、26春、2025寒假、春2026（「冬」可代替寒）' });
+      setMessage({ type: 'error', text: '学年/届次格式不正确，请使用如：25秋、25寒、26暑、26春、2025寒假、春2026（「冬」可代替寒）' });
       return;
     }
 
@@ -819,7 +977,7 @@ export default function Home() {
         setMessage({ type: 'error', text: '未登录或登录已过期，请重新登录后再上传' });
         return;
       }
-      let data: { success?: boolean; error?: string; data?: { is_update?: boolean; class_name?: string; student_count?: number } } = {};
+      let data: { success?: boolean; error?: string; data?: { is_update?: boolean; class_name?: string; student_count?: number; warning?: string } } = {};
       try {
         data = await res.json();
       } catch {
@@ -828,11 +986,14 @@ export default function Home() {
       }
 
       if (res.ok && data.success) {
-        const msg = data.data.is_update
-          ? `已更新！${data.data.class_name} 现共包含 ${data.data.student_count} 名学生`
-          : `上传成功！已导入 ${data.data.student_count} 名学生`;
-        setMessage({ type: 'success', text: msg });
+        const uploaded = data.data ?? {};
+        const msg = uploaded.is_update
+          ? `已更新！${uploaded.class_name} 现共包含 ${uploaded.student_count} 名学生`
+          : `上传成功！已导入 ${uploaded.student_count} 名学生`;
+        setMessage({ type: 'success', text: uploaded.warning ? `${msg}。${uploaded.warning}` : msg });
         setFile(null);
+        setUploadPreview(null);
+        setShowAllUploadPreviewRows(false);
         setClassName('');
         fetchClasses();
       } else {
@@ -854,7 +1015,7 @@ export default function Home() {
         return;
       }
       if (effectivePlanTerms.sourceClassIds.length === 0 || effectivePlanTerms.targetClassIds.length === 0) {
-        setMessage({ type: 'error', text: '当前年份缺少可统计的学期（请确认已上传对应秋/寒/春班级）' });
+        setMessage({ type: 'error', text: '当前年份缺少可统计的学期（请确认已上传对应秋/寒/暑/春班级）' });
         return;
       }
       const planLabel =
@@ -862,6 +1023,8 @@ export default function Home() {
           ? '秋升春'
           : effectivePlanTerms.effectivePlan === 'winter_to_spring'
           ? '寒升春'
+          : effectivePlanTerms.effectivePlan === 'summer_to_autumn'
+          ? '暑升秋'
           : '秋寒升春';
       payload = {
         fromTerms: effectivePlanTerms.fromTerms,
@@ -869,7 +1032,7 @@ export default function Home() {
         sourceClassIds: effectivePlanTerms.sourceClassIds,
         targetClassIds: effectivePlanTerms.targetClassIds,
         fromTermLabel: `${statYear}年${planLabel}`,
-        toTermLabel: `${statYear}年春季`,
+        toTermLabel: `${statYear}年${effectivePlanTerms.effectivePlan === 'summer_to_autumn' ? '秋季' : '春季'}`,
       };
     } else {
       if (!fromTerm || !toTerm) {
@@ -1103,15 +1266,15 @@ export default function Home() {
 
   // 导出学生列表为 CSV
   const exportStudentsToCsv = (students: ClassDetail[], classInfo: { name: string; total_lessons: number; term: string }) => {
-    const headers = ['序号', '姓名', '已上课时', '总课时', '出勤率', '优惠/免费排除', '备注'];
+    const headers = ['序号', '姓名', '已上课时', '总课时', '出勤率', '排除类型', '原始备注'];
     const rows = students.map((student, index) => [
       index + 1,
       student.name,
       student.lessons_attended,
       classInfo.total_lessons,
       `${((student.lessons_attended / classInfo.total_lessons) * 100).toFixed(1)}%`,
-      student.is_excluded ? '已排除' : '正常',
-      student.remark || (student.is_excluded ? '系统' : ''),
+      student.is_excluded ? (student.remark || '已排除') : '正常',
+      student.original_remark?.trim() || '',
     ]);
 
     const csvContent = [
@@ -1348,9 +1511,14 @@ export default function Home() {
   // 筛选学生
   const filteredStudents = selectedClass?.students.filter((student) => {
     const matchSearch = student.name.toLowerCase().includes(searchTerm.toLowerCase());
+    const normalizedRemark = String(student.remark || '').trim();
     const matchFilter = studentFilter === 'all' || 
       (studentFilter === 'normal' && !student.is_excluded) ||
-      (studentFilter === 'excluded' && student.is_excluded);
+      (studentFilter === 'excluded' && student.is_excluded) ||
+      (studentFilter === 'free' && normalizedRemark === '免费') ||
+      (studentFilter === 'half_free' && normalizedRemark === '半免') ||
+      (studentFilter === 'withdraw' && normalizedRemark === '退费/退班') ||
+      (studentFilter === 'low_attendance' && normalizedRemark === '课时不足');
     return matchSearch && matchFilter;
   }) || [];
 
@@ -1725,7 +1893,7 @@ export default function Home() {
                     <label className="text-sm font-medium">学年 / 届次</label>
                     <Input
                       list="school-term-suggestions"
-                      placeholder="例如：26寒、26春、2025寒假"
+                      placeholder="例如：26寒、26暑、26春、2025寒假"
                       value={term}
                       onChange={(e) => setTerm(e.target.value)}
                     />
@@ -1734,7 +1902,7 @@ export default function Home() {
                         <option key={t} value={t} />
                       ))}
                     </datalist>
-                    <p className="text-xs text-slate-500">请按统一格式填写：如 25秋、25寒、26春、2025寒假、春2026（用于按年份口径统计）。</p>
+                    <p className="text-xs text-slate-500">请按统一格式填写：如 25秋、25寒、26暑、26春、2025寒假、春2026（用于按年份口径统计）。</p>
                   </div>
                   <div className="space-y-2">
                     <label className="text-sm font-medium">总课时数</label>
@@ -1758,20 +1926,13 @@ export default function Home() {
                     onDrop={(e) => {
                       e.preventDefault();
                       e.stopPropagation();
-                      const f = e.dataTransfer.files?.[0];
-                      if (!f) return;
-                      const lower = f.name.toLowerCase();
-                      if (!lower.endsWith('.xlsx') && !lower.endsWith('.xls') && !lower.endsWith('.csv')) {
-                        setMessage({ type: 'error', text: '请拖入 Excel（.xlsx / .xls）或 CSV 文件' });
-                        return;
-                      }
-                      setFile(f);
+                      handleChooseUploadFile(e.dataTransfer.files?.[0] || null);
                     }}
                   >
                     <input
                       type="file"
                       accept=".xlsx,.xls,.csv"
-                      onChange={(e) => setFile(e.target.files?.[0] || null)}
+                      onChange={(e) => handleChooseUploadFile(e.target.files?.[0] || null)}
                       className="hidden"
                       id="file-upload"
                     />
@@ -1784,6 +1945,64 @@ export default function Home() {
                     </label>
                   </div>
                 </div>
+
+                {file ? (
+                  <div className="bg-slate-50 dark:bg-slate-800 rounded-lg p-4 space-y-3">
+                    <div className="flex items-center justify-between gap-2">
+                      <h4 className="font-medium">上传前预览</h4>
+                      {parsingPreview ? <span className="text-xs text-slate-500">解析中...</span> : null}
+                    </div>
+                    {uploadPreview ? (
+                      <>
+                        <div className="grid grid-cols-2 md:grid-cols-5 gap-2 text-xs">
+                          <div className="rounded border p-2">总人数：<span className="font-semibold">{uploadPreview.total_students}</span></div>
+                          <div className="rounded border p-2 text-emerald-700">免费：<span className="font-semibold">{uploadPreview.free_count}</span></div>
+                          <div className="rounded border p-2 text-amber-700">半免：<span className="font-semibold">{uploadPreview.half_free_count}</span></div>
+                          <div className="rounded border p-2 text-rose-700">退费/退班：<span className="font-semibold">{uploadPreview.withdraw_count}</span></div>
+                          <div className="rounded border p-2 text-violet-700">课时不足：<span className="font-semibold">{uploadPreview.low_attendance_count}</span></div>
+                        </div>
+                        <div className="flex items-center justify-between text-xs">
+                          <span className="text-slate-500">
+                            当前显示：{showAllUploadPreviewRows ? `全部 ${uploadPreview.rows.length} 行` : `前 ${Math.min(10, uploadPreview.rows.length)} 行`}
+                          </span>
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            onClick={() => setShowAllUploadPreviewRows((v) => !v)}
+                          >
+                            {showAllUploadPreviewRows ? '收起为前10行' : '查看全部'}
+                          </Button>
+                        </div>
+                        <div className="border rounded-md overflow-hidden">
+                          <Table>
+                            <TableHeader>
+                              <TableRow>
+                                <TableHead className="w-16">序号</TableHead>
+                                <TableHead>姓名</TableHead>
+                                <TableHead className="text-center">课时</TableHead>
+                                <TableHead>识别结果</TableHead>
+                              </TableRow>
+                            </TableHeader>
+                            <TableBody>
+                              {(showAllUploadPreviewRows ? uploadPreview.rows : uploadPreview.rows.slice(0, 10)).map((row, idx) => (
+                                <TableRow key={`upload-preview-${row.name}-${idx}`}>
+                                  <TableCell>{idx + 1}</TableCell>
+                                  <TableCell>{row.name}</TableCell>
+                                  <TableCell className="text-center">{row.lessons_attended}</TableCell>
+                                  <TableCell>{row.display_remark || '正常'}</TableCell>
+                                </TableRow>
+                              ))}
+                            </TableBody>
+                          </Table>
+                        </div>
+                        <p className="text-xs text-slate-500">预览仅用于核对识别；实际上传会按同一规则处理全部学生。</p>
+                      </>
+                    ) : (
+                      <p className="text-xs text-slate-500">文件已选择，等待解析结果...</p>
+                    )}
+                  </div>
+                ) : null}
 
                 <div className="bg-slate-50 dark:bg-slate-800 rounded-lg p-4">
                   <h4 className="font-medium mb-2">文件格式要求</h4>
@@ -1994,7 +2213,7 @@ export default function Home() {
                 {statsYearOptions.length > 0 ? (
                   <div className="space-y-3 rounded-lg border p-4 bg-slate-50/70 dark:bg-slate-900/30">
                     <p className="text-sm text-slate-600 dark:text-slate-400">
-                      按“年份 + 口径”统计：支持秋升春、寒升春、秋寒升春。
+                      按“年份 + 口径”统计：支持秋升春、寒升春、秋寒升春、暑升秋。
                     </p>
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                       <div className="space-y-2">
@@ -2022,6 +2241,7 @@ export default function Home() {
                             <SelectItem value="autumn_to_spring">秋升春</SelectItem>
                             <SelectItem value="winter_to_spring">寒升春</SelectItem>
                             <SelectItem value="autumn_winter_to_spring">秋寒升春</SelectItem>
+                            <SelectItem value="summer_to_autumn">暑升秋</SelectItem>
                           </SelectContent>
                         </Select>
                       </div>
@@ -3191,7 +3411,7 @@ export default function Home() {
                         />
                       </div>
                       {/* 学生筛选 */}
-                      <Select value={studentFilter} onValueChange={(v: 'all' | 'normal' | 'excluded') => setStudentFilter(v)}>
+                      <Select value={studentFilter} onValueChange={(v: 'all' | 'normal' | 'excluded' | 'free' | 'half_free' | 'withdraw' | 'low_attendance') => setStudentFilter(v)}>
                         <SelectTrigger className="w-32">
                           <SelectValue placeholder="学生范围" />
                         </SelectTrigger>
@@ -3199,6 +3419,10 @@ export default function Home() {
                           <SelectItem value="all">全部学生</SelectItem>
                           <SelectItem value="normal">正常学生</SelectItem>
                           <SelectItem value="excluded">已排除</SelectItem>
+                          <SelectItem value="free">仅免费</SelectItem>
+                          <SelectItem value="half_free">仅半免</SelectItem>
+                          <SelectItem value="withdraw">仅退费/退班</SelectItem>
+                          <SelectItem value="low_attendance">仅课时不足</SelectItem>
                         </SelectContent>
                       </Select>
                       {excludedStudents.length > 0 && (
@@ -3277,7 +3501,8 @@ export default function Home() {
                             <TableHead className="text-center">已上课时</TableHead>
                             <TableHead className="text-center">总课时</TableHead>
                             <TableHead className="text-center">出勤率</TableHead>
-                            <TableHead className="text-center">优惠/免费排除</TableHead>
+                            <TableHead className="text-center">排除类型</TableHead>
+                            <TableHead>原始备注</TableHead>
                             <TableHead className="text-center w-24">操作</TableHead>
                           </TableRow>
                         </TableHeader>
@@ -3348,9 +3573,12 @@ export default function Home() {
                                   />
                                 ) : (
                                   <Badge variant={student.is_excluded ? 'destructive' : 'secondary'}>
-                                    {student.is_excluded ? '已排除' : '正常'}
+                                    {student.is_excluded ? student.remark || '已排除' : '正常'}
                                   </Badge>
                                 )}
+                              </TableCell>
+                              <TableCell className="text-slate-600">
+                                {student.original_remark?.trim() || '—'}
                               </TableCell>
                               <TableCell className="text-center">
                                 {editingStudentId === student.id ? (
@@ -3387,7 +3615,7 @@ export default function Home() {
                           ))}
                           {filteredStudents.length === 0 && (
                             <TableRow>
-                              <TableCell colSpan={7} className="text-center py-8 text-slate-500">
+                              <TableCell colSpan={8} className="text-center py-8 text-slate-500">
                                 {searchTerm ? '没有找到符合条件的学生' : '暂无学生数据'}
                               </TableCell>
                             </TableRow>

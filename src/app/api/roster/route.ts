@@ -132,6 +132,7 @@ export async function POST(request: NextRequest) {
     }
 
     // 2. 处理学生数据
+    let usedRemarkFallback = false;
     for (const student of parsedRoster.students) {
       // 查找或创建学生
       let { data: existingStudent } = await supabase
@@ -163,6 +164,7 @@ export async function POST(request: NextRequest) {
         });
 
       if (recordResult.error && /remark/i.test(recordResult.error.message)) {
+        usedRemarkFallback = true;
         recordResult = await supabase
           .from('attendance_records')
           .insert({
@@ -184,6 +186,9 @@ export async function POST(request: NextRequest) {
         total_lessons: totalLessons,
         student_count: parsedRoster.students.length,
         is_update: isUpdate,
+        warning: usedRemarkFallback
+          ? '当前数据库未启用 attendance_records.remark 字段，免费/半免将无法长期精确区分。建议在 Supabase 执行 scripts/sql/add-attendance-remark.sql。'
+          : undefined,
       },
     });
   } catch (error: unknown) {
