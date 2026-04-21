@@ -40,7 +40,12 @@ export async function GET(
       let remark = '';
       if (record.is_half_free) {
         const rawRemark = String((record as { remark?: string | null }).remark || '').trim();
-        remark = rawRemark.includes('免费') || rawRemark.includes('全免') ? '免费' : '半免';
+        const isFreeLike =
+          rawRemark.includes('免费') ||
+          rawRemark.includes('全免') ||
+          rawRemark.includes('免学费') ||
+          rawRemark.includes('减免');
+        remark = isFreeLike ? '免费' : '半免';
       } else if (lessonsAttended === 0) {
         remark = '退费/退班';
       } else if (isExcludedByAttendance) {
@@ -54,6 +59,7 @@ export async function GET(
         is_half_free: !!record.is_half_free,
         is_excluded: isExcluded,
         remark: remark,
+        original_remark: String((record as { remark?: string | null }).remark || ''),
       };
     });
 
