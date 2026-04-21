@@ -7,6 +7,7 @@ interface StudentRecord {
   lessons_attended: number;
   is_half_free: boolean;
   remark?: string | null;
+  exclude_label?: 'free' | 'half_free' | 'withdraw' | null;
 }
 
 interface ParsedRoster {
@@ -14,6 +15,28 @@ interface ParsedRoster {
   term: string;
   total_lessons: number;
   students: StudentRecord[];
+}
+
+function isMissingClassesUserIdError(message: string): boolean {
+  return /user_id/i.test(message) && (/classes/i.test(message) || /schema cache/i.test(message));
+}
+
+function rosterErrorForClient(message: string): string {
+  if (isMissingClassesUserIdError(message)) {
+    return (
+      '创建班级失败：数据库表 classes 与当前代码不一致。若无法执行 SQL 迁移，请联系管理员；也可在 Supabase 执行 scripts/sql/add-classes-user-id.sql 后重试。'
+    );
+  }
+  return message;
+}
+
+function isValidTermFormat(term: string): boolean {
+  const s = String(term || '').replace(/\s+/g, '');
+  return (
+    /^(20\d{2}|\d{2})(?:年)?(?:学年)?(春|秋|寒|暑|冬)(?:季|假)?$/u.test(s) ||
+    /^(春|秋|寒|暑|冬)(?:季|假)?(20\d{2}|\d{2})$/u.test(s) ||
+    /^(20\d{2}|\d{2})-(20\d{2}|\d{2})(?:学年)?$/u.test(s)
+  );
 }
 
 export async function POST(request: NextRequest) {
@@ -27,6 +50,12 @@ export async function POST(request: NextRequest) {
     if (!file || !className || !term) {
       return NextResponse.json(
         { error: '缺少必要参数：file, className, term' },
+        { status: 400 }
+      );
+    }
+    if (!isValidTermFormat(term)) {
+      return NextResponse.json(
+        { error: 'term 格式不正确，请使用如：25秋、25寒、26春、2025寒假、春2026' },
         { status: 400 }
       );
     }
@@ -74,8 +103,8 @@ export async function POST(request: NextRequest) {
 
       if (deleteError) throw new Error(`删除旧数据失败: ${deleteError.message}`);
     } else {
-      // 不存在同名班级，创建新班级
-      const { data: newClass, error: classError } = await supabase
+      // 不存在同名班级，创建新班级（兼容尚未迁移 user_id 列的旧库）
+      let insertResult = await supabase
         .from('classes')
         .insert({
           user_id: 'shared',
@@ -86,8 +115,20 @@ export async function POST(request: NextRequest) {
         .select('id')
         .single();
 
-      if (classError) throw new Error(`创建班级失败: ${classError.message}`);
-      classId = newClass.id;
+      if (insertResult.error && isMissingClassesUserIdError(insertResult.error.message)) {
+        insertResult = await supabase
+          .from('classes')
+          .insert({
+            name: className,
+            term: term,
+            total_lessons: totalLessons,
+          })
+          .select('id')
+          .single();
+      }
+
+      if (insertResult.error) throw new Error(`创建班级失败: ${insertResult.error.message}`);
+      classId = insertResult.data!.id;
     }
 
     // 2. 处理学生数据
@@ -110,17 +151,29 @@ export async function POST(request: NextRequest) {
         existingStudent = newStudent;
       }
 
-      // 创建点名记录
-      const { error: recordError } = await supabase
+      // 创建点名记录：优先携带 remark（用于区分免费/半免展示），旧库无该列时自动回退
+      let recordResult = await supabase
         .from('attendance_records')
         .insert({
           class_id: classId,
           student_id: existingStudent.id,
           lessons_attended: student.lessons_attended,
           is_half_free: student.is_half_free,
+          remark: student.remark ?? (student.exclude_label === 'free' ? '免费' : student.exclude_label === 'half_free' ? '半免' : null),
         });
 
-      if (recordError) throw new Error(`创建点名记录失败: ${recordError.message}`);
+      if (recordResult.error && /remark/i.test(recordResult.error.message)) {
+        recordResult = await supabase
+          .from('attendance_records')
+          .insert({
+            class_id: classId,
+            student_id: existingStudent.id,
+            lessons_attended: student.lessons_attended,
+            is_half_free: student.is_half_free,
+          });
+      }
+
+      if (recordResult.error) throw new Error(`创建点名记录失败: ${recordResult.error.message}`);
     }
 
     return NextResponse.json({
@@ -135,9 +188,9 @@ export async function POST(request: NextRequest) {
     });
   } catch (error: unknown) {
     console.error('上传点名册失败:', error);
-    const message = error instanceof Error ? error.message : '上传失败';
+    const raw = error instanceof Error ? error.message : '上传失败';
     return NextResponse.json(
-      { error: message },
+      { error: rosterErrorForClient(raw) },
       { status: 500 }
     );
   }
@@ -232,16 +285,20 @@ function parseRosterData(
   if (lessonsIndex === -1) lessonsIndex = 1;
   // remarkIndex 和 halfFreeIndex 可选，不设默认值
 
-  const halfFreeKeywords = ['半免', '免费', '优惠', '折扣', 'half'];
+  const freeKeywords = ['免费', '全免', '免学费'];
+  const halfFreeKeywords = ['半免', '优惠', '折扣', 'half'];
   const withdrawKeywords = ['退费', '试听', '休学', '退学', '退款', '取消', '退'];
 
   function parseExcludeFlags(
     remarkValue: string | number | boolean | null,
     halfFreeValue?: string | number | boolean | null
-  ): { isHalfFree: boolean; isWithdrawLike: boolean } {
+  ): { isHalfFree: boolean; isWithdrawLike: boolean; label: 'free' | 'half_free' | 'withdraw' | null } {
     const remark = String(remarkValue || '').toLowerCase().trim();
     const halfValue = String(halfFreeValue || '').toLowerCase().trim();
 
+    const isFreeByRemark = freeKeywords.some((keyword) => remark.includes(keyword.toLowerCase()));
+    const isFreeByColumn = freeKeywords.some((keyword) => halfValue.includes(keyword.toLowerCase()));
+    const isFree = isFreeByRemark || isFreeByColumn;
     const isHalfFreeByRemark = halfFreeKeywords.some((keyword) => remark.includes(keyword.toLowerCase()));
     const isWithdrawByRemark = withdrawKeywords.some((keyword) => remark.includes(keyword.toLowerCase()));
 
@@ -256,8 +313,9 @@ function parseRosterData(
     const isWithdrawByColumn = withdrawKeywords.some((keyword) => halfValue.includes(keyword.toLowerCase()));
 
     return {
-      isHalfFree: isHalfFreeByRemark || isHalfFreeByColumn,
+      isHalfFree: isFree || isHalfFreeByRemark || isHalfFreeByColumn,
       isWithdrawLike: isWithdrawByRemark || isWithdrawByColumn,
+      label: isWithdrawByRemark || isWithdrawByColumn ? 'withdraw' : isFree ? 'free' : isHalfFreeByRemark || isHalfFreeByColumn ? 'half_free' : null,
     };
   }
 
@@ -301,6 +359,7 @@ function parseRosterData(
       lessons_attended: lessonsAttended,
       is_half_free: flags.isHalfFree,
       remark: remarkValue,
+      exclude_label: flags.label,
     });
   }
 

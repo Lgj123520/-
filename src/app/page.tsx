@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useCallback } from 'react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -14,22 +14,17 @@ import { Checkbox } from '@/components/ui/checkbox';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Label } from '@/components/ui/label';
 import { Upload, BarChart3, FileSpreadsheet, CheckCircle2, XCircle, Loader2, Download, UserX, Users, UserCheck, Eye, Trash2, Edit, Search, X, Pencil, LogOut } from 'lucide-react';
-import { compareGradeLabels } from '@/lib/class-grade';
+import { compareGradeLabels, extractGradeFromClassName } from '@/lib/class-grade';
 import { compareSchoolYearLabels, groupClassesBySchoolYearAndGrade } from '@/lib/class-org';
 
 /** 上传「学年/届次」输入框的下拉建议（可与已有数据合并） */
 const SCHOOL_TERM_SUGGESTIONS = [
-  '2024学年',
-  '2025学年',
-  '2026学年',
-  '2024秋',
-  '2025秋',
-  '2024春',
-  '2025春',
-  '寒假',
-  '春季',
-  '暑假',
-  '秋季',
+  '25秋',
+  '25寒',
+  '26春',
+  '26秋',
+  '26寒',
+  '27春',
 ];
 
 const EXPORT_CLASS_FILTER_ALL = '__all__';
@@ -58,6 +53,52 @@ function clientErrorToZhMessage(error: unknown, fallback: string): string {
     return '请求已中断';
   }
   return m;
+}
+
+function isValidTermFormat(term: string): boolean {
+  const s = term.replace(/\s+/g, '');
+  // 允许：25秋 / 2025寒假 / 春2026 / 2025-2026学年（取前一年）；「冬」视同寒假口径
+  return (
+    /^(20\d{2}|\d{2})(?:年)?(?:学年)?(春|秋|寒|暑|冬)(?:季|假)?$/u.test(s) ||
+    /^(春|秋|寒|暑|冬)(?:季|假)?(20\d{2}|\d{2})$/u.test(s) ||
+    /^(20\d{2}|\d{2})-(20\d{2}|\d{2})(?:学年)?$/u.test(s)
+  );
+}
+
+type SeasonTag = 'spring' | 'autumn' | 'winter' | 'summer' | 'unknown';
+type StatPlan = 'autumn_to_spring' | 'winter_to_spring' | 'autumn_winter_to_spring';
+
+function detectSeasonTag(term: string): SeasonTag {
+  if (term.includes('春')) return 'spring';
+  if (term.includes('秋')) return 'autumn';
+  if (term.includes('寒') || term.includes('冬')) return 'winter';
+  if (term.includes('暑')) return 'summer';
+  return 'unknown';
+}
+
+function extractYearToken(term: string): string | null {
+  const m = term.match(/(20\d{2}|\d{2})(?=[^\d]|$)/);
+  return m ? m[1].slice(-2).padStart(2, '0') : null;
+}
+
+function extractYearTokenFromText(text: string): string | null {
+  const s = text.replace(/\s+/g, '');
+  const season = '(春|秋|寒|暑)';
+  const to2 = (v: string): string => v.slice(-2).padStart(2, '0');
+  const m1 = s.match(new RegExp(`(20\\d{2}|\\d{2})(?:年)?(?:学年)?${season}`));
+  if (m1) return to2(m1[1]);
+  const m2 = s.match(new RegExp(`${season}(20\\d{2}|\\d{2})`));
+  if (m2) return to2(m2[2]);
+  const m3 = s.match(/(20\d{2}|20\d{2}-20\d{2}|\d{2}-\d{2})(?:学年)?/);
+  if (!m3) return null;
+  const head = m3[1].split('-')[0];
+  return head.length >= 2 ? to2(head) : null;
+}
+
+function nextYearToken(year: string): string {
+  const n = parseInt(year, 10);
+  if (!Number.isFinite(n)) return year;
+  return String((n + 1) % 100).padStart(2, '0');
 }
 
 interface ClassInfo {
@@ -94,6 +135,8 @@ interface StudentDetail {
   lessons_attended: number;
   total_lessons: number;
   class_name?: string;
+  source_term?: string;
+  target_term?: string;
   /** 续读学生所在目标学年班级名称，多班用顿号连接 */
   renewed_to_class?: string;
 }
@@ -106,9 +149,11 @@ interface RenewalResult {
   valid_students: number;
   renewed_students: number;
   not_renewed_students: number;
+  new_students?: number;
   renewal_rate: string;
   renewed_details: StudentDetail[];
   not_renewed_details: StudentDetail[];
+  new_student_details?: StudentDetail[];
   class_stats: ClassStat[];
   grade_stats?: GradeStat[];
 }
@@ -192,13 +237,25 @@ export default function Home() {
   // 统计表单
   const [fromTerm, setFromTerm] = useState('');
   const [toTerm, setToTerm] = useState('');
+  const [statYear, setStatYear] = useState('');
+  const [statPlan, setStatPlan] = useState<StatPlan>('autumn_to_spring');
   const [result, setResult] = useState<RenewalResult | null>(null);
   const [calculating, setCalculating] = useState(false);
   /** 续读名单导出：按源班级 / 续读目标班级筛选 */
   const [renewedExportSourceClass, setRenewedExportSourceClass] = useState<string>(EXPORT_CLASS_FILTER_ALL);
   const [renewedExportTargetClass, setRenewedExportTargetClass] = useState<string>(EXPORT_CLASS_FILTER_ALL);
+  const [renewedExportSourceGrade, setRenewedExportSourceGrade] = useState<string>(EXPORT_CLASS_FILTER_ALL);
+  const [renewedExportTargetGrade, setRenewedExportTargetGrade] = useState<string>(EXPORT_CLASS_FILTER_ALL);
+  const [renewedExportSourceYear, setRenewedExportSourceYear] = useState<string>(EXPORT_CLASS_FILTER_ALL);
+  const [renewedExportTargetYear, setRenewedExportTargetYear] = useState<string>(EXPORT_CLASS_FILTER_ALL);
   /** 未续班名单导出：按源班级筛选 */
   const [notRenewedExportSourceClass, setNotRenewedExportSourceClass] = useState<string>(EXPORT_CLASS_FILTER_ALL);
+  const [notRenewedExportSourceGrade, setNotRenewedExportSourceGrade] = useState<string>(EXPORT_CLASS_FILTER_ALL);
+  const [notRenewedExportSourceYear, setNotRenewedExportSourceYear] = useState<string>(EXPORT_CLASS_FILTER_ALL);
+  /** 新生名单导出：按目标班级筛选 */
+  const [newStudentExportTargetClass, setNewStudentExportTargetClass] = useState<string>(EXPORT_CLASS_FILTER_ALL);
+  const [newStudentExportTargetGrade, setNewStudentExportTargetGrade] = useState<string>(EXPORT_CLASS_FILTER_ALL);
+  const [newStudentExportTargetYear, setNewStudentExportTargetYear] = useState<string>(EXPORT_CLASS_FILTER_ALL);
 
   // 相似姓名匹配
   const [matchFromTerm, setMatchFromTerm] = useState('');
@@ -256,6 +313,14 @@ export default function Home() {
     setBatchLessonInput('');
   }, [selectedClass?.class.id]);
 
+  /** 提示在页面顶部，用户在下方点上传时容易看不到；有新消息时滚到提示处 */
+  useEffect(() => {
+    if (!message) return;
+    queueMicrotask(() => {
+      document.getElementById('app-global-message')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    });
+  }, [message]);
+
   /** 按年级分组后的班级续班率，用于首页与统计表格展示 */
   const groupClassStatsByGrade = useMemo(() => {
     if (!result?.class_stats?.length) return [] as { grade: string; rows: ClassStat[] }[];
@@ -294,7 +359,16 @@ export default function Home() {
     if (!result) return;
     setRenewedExportSourceClass(EXPORT_CLASS_FILTER_ALL);
     setRenewedExportTargetClass(EXPORT_CLASS_FILTER_ALL);
+    setRenewedExportSourceGrade(EXPORT_CLASS_FILTER_ALL);
+    setRenewedExportTargetGrade(EXPORT_CLASS_FILTER_ALL);
+    setRenewedExportSourceYear(EXPORT_CLASS_FILTER_ALL);
+    setRenewedExportTargetYear(EXPORT_CLASS_FILTER_ALL);
     setNotRenewedExportSourceClass(EXPORT_CLASS_FILTER_ALL);
+    setNotRenewedExportSourceGrade(EXPORT_CLASS_FILTER_ALL);
+    setNotRenewedExportSourceYear(EXPORT_CLASS_FILTER_ALL);
+    setNewStudentExportTargetClass(EXPORT_CLASS_FILTER_ALL);
+    setNewStudentExportTargetGrade(EXPORT_CLASS_FILTER_ALL);
+    setNewStudentExportTargetYear(EXPORT_CLASS_FILTER_ALL);
   }, [result]);
 
   const renewedExportSourceOptions = useMemo(() => {
@@ -316,6 +390,30 @@ export default function Home() {
     return [...s].sort((a, b) => a.localeCompare(b, 'zh-CN'));
   }, [result?.renewed_details]);
 
+  const renewedExportSourceGradeOptions = useMemo(() => {
+    const s = new Set<string>();
+    for (const className of renewedExportSourceOptions) s.add(extractGradeFromClassName(className));
+    return [...s].sort(compareGradeLabels);
+  }, [renewedExportSourceOptions]);
+  const renewedExportSourceYearOptions = useMemo(() => {
+    if (!result?.renewed_details?.length) return [];
+    const s = new Set<string>();
+    for (const d of result.renewed_details) if (d.source_term) s.add(d.source_term);
+    return [...s].sort(compareSchoolYearLabels);
+  }, [result?.renewed_details]);
+
+  const renewedExportTargetGradeOptions = useMemo(() => {
+    const s = new Set<string>();
+    for (const className of renewedExportTargetOptions) s.add(extractGradeFromClassName(className));
+    return [...s].sort(compareGradeLabels);
+  }, [renewedExportTargetOptions]);
+  const renewedExportTargetYearOptions = useMemo(() => {
+    if (!result?.renewed_details?.length) return [];
+    const s = new Set<string>();
+    for (const d of result.renewed_details) if (d.target_term) s.add(d.target_term);
+    return [...s].sort(compareSchoolYearLabels);
+  }, [result?.renewed_details]);
+
   const notRenewedExportSourceOptions = useMemo(() => {
     if (!result?.not_renewed_details?.length) return [];
     const s = new Set<string>();
@@ -325,19 +423,84 @@ export default function Home() {
     return [...s].sort((a, b) => a.localeCompare(b, 'zh-CN'));
   }, [result?.not_renewed_details]);
 
+  const notRenewedExportSourceGradeOptions = useMemo(() => {
+    const s = new Set<string>();
+    for (const className of notRenewedExportSourceOptions) s.add(extractGradeFromClassName(className));
+    return [...s].sort(compareGradeLabels);
+  }, [notRenewedExportSourceOptions]);
+  const notRenewedExportSourceYearOptions = useMemo(() => {
+    if (!result?.not_renewed_details?.length) return [];
+    const s = new Set<string>();
+    for (const d of result.not_renewed_details) if (d.source_term) s.add(d.source_term);
+    return [...s].sort(compareSchoolYearLabels);
+  }, [result?.not_renewed_details]);
+
+  const newStudentExportTargetOptions = useMemo(() => {
+    if (!result?.new_student_details?.length) return [];
+    const s = new Set<string>();
+    for (const d of result.new_student_details) {
+      const parts = (d.class_name || '').split('、').map((x) => x.trim()).filter(Boolean);
+      for (const p of parts) s.add(p);
+    }
+    return [...s].sort((a, b) => a.localeCompare(b, 'zh-CN'));
+  }, [result?.new_student_details]);
+
+  const newStudentExportTargetGradeOptions = useMemo(() => {
+    const s = new Set<string>();
+    for (const className of newStudentExportTargetOptions) s.add(extractGradeFromClassName(className));
+    return [...s].sort(compareGradeLabels);
+  }, [newStudentExportTargetOptions]);
+  const newStudentExportTargetYearOptions = useMemo(() => {
+    if (!result?.new_student_details?.length) return [];
+    const s = new Set<string>();
+    for (const d of result.new_student_details) if (d.target_term) s.add(d.target_term);
+    return [...s].sort(compareSchoolYearLabels);
+  }, [result?.new_student_details]);
+
+  const quickYearOptions = useMemo(() => {
+    const s = new Set<string>();
+    for (const y of renewedExportSourceYearOptions) s.add(y);
+    for (const y of renewedExportTargetYearOptions) s.add(y);
+    for (const y of notRenewedExportSourceYearOptions) s.add(y);
+    for (const y of newStudentExportTargetYearOptions) s.add(y);
+    return [...s].sort(compareSchoolYearLabels);
+  }, [
+    renewedExportSourceYearOptions,
+    renewedExportTargetYearOptions,
+    notRenewedExportSourceYearOptions,
+    newStudentExportTargetYearOptions,
+  ]);
+
   const filteredRenewedDetails = useMemo(() => {
     if (!result?.renewed_details) return [];
     return result.renewed_details.filter((d) => {
       if (renewedExportSourceClass !== EXPORT_CLASS_FILTER_ALL && d.class_name !== renewedExportSourceClass) {
         return false;
       }
+      if (renewedExportSourceYear !== EXPORT_CLASS_FILTER_ALL && d.source_term !== renewedExportSourceYear) {
+        return false;
+      }
+      if (
+        renewedExportSourceGrade !== EXPORT_CLASS_FILTER_ALL &&
+        extractGradeFromClassName(d.class_name || '') !== renewedExportSourceGrade
+      ) {
+        return false;
+      }
       if (renewedExportTargetClass !== EXPORT_CLASS_FILTER_ALL) {
         const parts = (d.renewed_to_class || '').split('、').map((x) => x.trim());
         if (!parts.includes(renewedExportTargetClass)) return false;
       }
+      if (renewedExportTargetGrade !== EXPORT_CLASS_FILTER_ALL) {
+        const parts = (d.renewed_to_class || '').split('、').map((x) => x.trim()).filter(Boolean);
+        const hasGrade = parts.some((name) => extractGradeFromClassName(name) === renewedExportTargetGrade);
+        if (!hasGrade) return false;
+      }
+      if (renewedExportTargetYear !== EXPORT_CLASS_FILTER_ALL && d.target_term !== renewedExportTargetYear) {
+        return false;
+      }
       return true;
     });
-  }, [result?.renewed_details, renewedExportSourceClass, renewedExportTargetClass]);
+  }, [result?.renewed_details, renewedExportSourceClass, renewedExportSourceGrade, renewedExportSourceYear, renewedExportTargetClass, renewedExportTargetGrade, renewedExportTargetYear]);
 
   const filteredNotRenewedDetails = useMemo(() => {
     if (!result?.not_renewed_details) return [];
@@ -345,9 +508,33 @@ export default function Home() {
       if (notRenewedExportSourceClass !== EXPORT_CLASS_FILTER_ALL && d.class_name !== notRenewedExportSourceClass) {
         return false;
       }
+      if (notRenewedExportSourceYear !== EXPORT_CLASS_FILTER_ALL && d.source_term !== notRenewedExportSourceYear) {
+        return false;
+      }
+      if (
+        notRenewedExportSourceGrade !== EXPORT_CLASS_FILTER_ALL &&
+        extractGradeFromClassName(d.class_name || '') !== notRenewedExportSourceGrade
+      ) {
+        return false;
+      }
       return true;
     });
-  }, [result?.not_renewed_details, notRenewedExportSourceClass]);
+  }, [result?.not_renewed_details, notRenewedExportSourceClass, notRenewedExportSourceGrade, notRenewedExportSourceYear]);
+
+  const filteredNewStudentDetails = useMemo(() => {
+    if (!result?.new_student_details) return [];
+    return result.new_student_details.filter((d) => {
+      const parts = (d.class_name || '').split('、').map((x) => x.trim()).filter(Boolean);
+      if (newStudentExportTargetClass !== EXPORT_CLASS_FILTER_ALL && !parts.includes(newStudentExportTargetClass)) {
+        return false;
+      }
+      if (newStudentExportTargetYear !== EXPORT_CLASS_FILTER_ALL && d.target_term !== newStudentExportTargetYear) {
+        return false;
+      }
+      if (newStudentExportTargetGrade === EXPORT_CLASS_FILTER_ALL) return true;
+      return parts.some((name) => extractGradeFromClassName(name) === newStudentExportTargetGrade);
+    });
+  }, [result?.new_student_details, newStudentExportTargetClass, newStudentExportTargetGrade, newStudentExportTargetYear]);
 
   const fetchClasses = async () => {
     setLoading(true);
@@ -516,6 +703,68 @@ export default function Home() {
     [classes]
   );
 
+  const statsYearOptions = useMemo(() => {
+    const s = new Set<string>();
+    for (const c of classes) {
+      const fromTerm = extractYearTokenFromText(c.term);
+      const fromName = extractYearTokenFromText(c.name);
+      if (fromTerm) s.add(fromTerm);
+      if (fromName) s.add(fromName);
+    }
+    return [...s].sort(compareSchoolYearLabels);
+  }, [classes]);
+
+  const resolvePlanTerms = useCallback(
+    (plan: StatPlan) => {
+      if (!statYear) {
+        return { fromTerms: [] as string[], toTerms: [] as string[], sourceClassIds: [] as string[], targetClassIds: [] as string[] };
+      }
+      const nextYear = nextYearToken(statYear);
+      const matchSourceSeason = (season: SeasonTag) => {
+        if (plan === 'autumn_to_spring') return season === 'autumn';
+        if (plan === 'winter_to_spring') return season === 'winter';
+        return season === 'autumn' || season === 'winter';
+      };
+      const sourceClasses = classes.filter((c) => {
+        const y = extractYearTokenFromText(`${c.term} ${c.name}`);
+        const s = detectSeasonTag(`${c.term} ${c.name}`);
+        if (!matchSourceSeason(s)) return false;
+        // 兼容旧数据：若未写年份，也允许纳入当前统计口径。
+        return y === statYear || y === null;
+      });
+      const targetClasses = classes.filter((c) => {
+        const y = extractYearTokenFromText(`${c.term} ${c.name}`);
+        const s = detectSeasonTag(`${c.term} ${c.name}`);
+        if (s !== 'spring') return false;
+        return y === statYear || y === nextYear || y === null;
+      });
+      const fromTerms = [...new Set(sourceClasses.map((c) => c.term))];
+      const toTerms = [...new Set(targetClasses.map((c) => c.term))];
+      return {
+        fromTerms,
+        toTerms,
+        sourceClassIds: sourceClasses.map((c) => c.id),
+        targetClassIds: targetClasses.map((c) => c.id),
+      };
+    },
+    [classes, statYear]
+  );
+
+  const planTerms = useMemo(() => resolvePlanTerms(statPlan), [resolvePlanTerms, statPlan]);
+
+  const effectivePlanTerms = useMemo(() => {
+    const hasSource = planTerms.sourceClassIds.length > 0;
+    const hasTarget = planTerms.targetClassIds.length > 0;
+    if (statPlan !== 'autumn_winter_to_spring' || hasSource || !hasTarget) {
+      return { ...planTerms, effectivePlan: statPlan, autoDowngraded: false };
+    }
+    const winterOnly = resolvePlanTerms('winter_to_spring');
+    if (winterOnly.sourceClassIds.length === 0 || winterOnly.targetClassIds.length === 0) {
+      return { ...planTerms, effectivePlan: statPlan, autoDowngraded: false };
+    }
+    return { ...winterOnly, effectivePlan: 'winter_to_spring' as StatPlan, autoDowngraded: true };
+  }, [planTerms, resolvePlanTerms, statPlan]);
+
   const classesByYearAndGrade = useMemo(() => groupClassesBySchoolYearAndGrade(classes), [classes]);
 
   const termInputSuggestions = useMemo(() => {
@@ -545,6 +794,10 @@ export default function Home() {
       setMessage({ type: 'error', text: '请填写完整信息并选择文件' });
       return;
     }
+    if (!isValidTermFormat(term)) {
+      setMessage({ type: 'error', text: '学年/届次格式不正确，请使用如：25秋、25寒、26春、2025寒假、春2026（「冬」可代替寒）' });
+      return;
+    }
 
     setUploading(true);
     setMessage(null);
@@ -558,9 +811,21 @@ export default function Home() {
     try {
       const res = await fetch('/api/roster', {
         method: 'POST',
+        credentials: 'include',
         body: formData,
       });
-      const data = await res.json();
+      if (res.status === 401) {
+        setAuthUser(null);
+        setMessage({ type: 'error', text: '未登录或登录已过期，请重新登录后再上传' });
+        return;
+      }
+      let data: { success?: boolean; error?: string; data?: { is_update?: boolean; class_name?: string; student_count?: number } } = {};
+      try {
+        data = await res.json();
+      } catch {
+        setMessage({ type: 'error', text: `上传失败（服务器返回异常，HTTP ${res.status}）` });
+        return;
+      }
 
       if (res.ok && data.success) {
         const msg = data.data.is_update
@@ -582,9 +847,36 @@ export default function Home() {
 
   // 计算续班率
   const handleCalculate = async () => {
-    if (!fromTerm || !toTerm) {
-      setMessage({ type: 'error', text: '请选择源学年与目标学年（届次）' });
-      return;
+    let payload: Record<string, unknown>;
+    if (statsYearOptions.length > 0) {
+      if (!statYear) {
+        setMessage({ type: 'error', text: '请选择统计年份' });
+        return;
+      }
+      if (effectivePlanTerms.sourceClassIds.length === 0 || effectivePlanTerms.targetClassIds.length === 0) {
+        setMessage({ type: 'error', text: '当前年份缺少可统计的学期（请确认已上传对应秋/寒/春班级）' });
+        return;
+      }
+      const planLabel =
+        effectivePlanTerms.effectivePlan === 'autumn_to_spring'
+          ? '秋升春'
+          : effectivePlanTerms.effectivePlan === 'winter_to_spring'
+          ? '寒升春'
+          : '秋寒升春';
+      payload = {
+        fromTerms: effectivePlanTerms.fromTerms,
+        toTerms: effectivePlanTerms.toTerms,
+        sourceClassIds: effectivePlanTerms.sourceClassIds,
+        targetClassIds: effectivePlanTerms.targetClassIds,
+        fromTermLabel: `${statYear}年${planLabel}`,
+        toTermLabel: `${statYear}年春季`,
+      };
+    } else {
+      if (!fromTerm || !toTerm) {
+        setMessage({ type: 'error', text: '请选择源学年与目标学年（届次）' });
+        return;
+      }
+      payload = { fromTerm, toTerm };
     }
 
     setCalculating(true);
@@ -592,10 +884,13 @@ export default function Home() {
     setMessage(null);
 
     try {
+      if (statsYearOptions.length > 0 && effectivePlanTerms.autoDowngraded) {
+        setMessage({ type: 'success', text: '未找到秋季源班，已自动按“寒升春”口径计算。' });
+      }
       const res = await fetch('/api/statistics', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ fromTerm, toTerm }),
+        body: JSON.stringify(payload),
       });
       const data = await res.json();
 
@@ -808,7 +1103,7 @@ export default function Home() {
 
   // 导出学生列表为 CSV
   const exportStudentsToCsv = (students: ClassDetail[], classInfo: { name: string; total_lessons: number; term: string }) => {
-    const headers = ['序号', '姓名', '已上课时', '总课时', '出勤率', '半免', '备注'];
+    const headers = ['序号', '姓名', '已上课时', '总课时', '出勤率', '优惠/免费排除', '备注'];
     const rows = students.map((student, index) => [
       index + 1,
       student.name,
@@ -1092,7 +1387,15 @@ export default function Home() {
       notRenewedExportSourceClass !== EXPORT_CLASS_FILTER_ALL
         ? `_${sanitizeCsvFilenamePart(notRenewedExportSourceClass)}`
         : '';
-    link.download = `${result.from_term}_未续班学生名单${srcPart}_${formatZhDate(Date.now()).replace(/\//g, '-')}.csv`;
+    const srcYearPart =
+      notRenewedExportSourceYear !== EXPORT_CLASS_FILTER_ALL
+        ? `_源年份_${sanitizeCsvFilenamePart(notRenewedExportSourceYear)}`
+        : '';
+    const srcGradePart =
+      notRenewedExportSourceGrade !== EXPORT_CLASS_FILTER_ALL
+        ? `_源年级_${sanitizeCsvFilenamePart(notRenewedExportSourceGrade)}`
+        : '';
+    link.download = `${result.from_term}_未续班学生名单${srcPart}${srcYearPart}${srcGradePart}_${formatZhDate(Date.now()).replace(/\//g, '-')}.csv`;
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -1128,11 +1431,70 @@ export default function Home() {
       renewedExportSourceClass !== EXPORT_CLASS_FILTER_ALL
         ? `_${sanitizeCsvFilenamePart(renewedExportSourceClass)}`
         : '';
+    const srcYearPart =
+      renewedExportSourceYear !== EXPORT_CLASS_FILTER_ALL
+        ? `_源年份_${sanitizeCsvFilenamePart(renewedExportSourceYear)}`
+        : '';
+    const srcGradePart =
+      renewedExportSourceGrade !== EXPORT_CLASS_FILTER_ALL
+        ? `_源年级_${sanitizeCsvFilenamePart(renewedExportSourceGrade)}`
+        : '';
     const tgtPart =
       renewedExportTargetClass !== EXPORT_CLASS_FILTER_ALL
         ? `_续读至_${sanitizeCsvFilenamePart(renewedExportTargetClass)}`
         : '';
-    link.download = `${result.from_term}_续班学生名单${srcPart}${tgtPart}_${formatZhDate(Date.now()).replace(/\//g, '-')}.csv`;
+    const tgtGradePart =
+      renewedExportTargetGrade !== EXPORT_CLASS_FILTER_ALL
+        ? `_续读年级_${sanitizeCsvFilenamePart(renewedExportTargetGrade)}`
+        : '';
+    const tgtYearPart =
+      renewedExportTargetYear !== EXPORT_CLASS_FILTER_ALL
+        ? `_续读年份_${sanitizeCsvFilenamePart(renewedExportTargetYear)}`
+        : '';
+    link.download = `${result.from_term}_续班学生名单${srcPart}${srcYearPart}${srcGradePart}${tgtPart}${tgtYearPart}${tgtGradePart}_${formatZhDate(Date.now()).replace(/\//g, '-')}.csv`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
+
+  // 导出新生名单，可按目标班级筛选
+  const exportNewStudentList = () => {
+    if (!result || !filteredNewStudentDetails.length) return;
+
+    const headers = ['序号', '姓名', '目标班级', '已上课时', '总课时', '出勤率'];
+    const rows = filteredNewStudentDetails.map((student, index) => [
+      index + 1,
+      student.name,
+      student.class_name || '未知班级',
+      student.lessons_attended,
+      student.total_lessons,
+      `${((student.lessons_attended / student.total_lessons) * 100).toFixed(1)}%`,
+    ]);
+
+    const csvContent = [
+      headers.join(','),
+      ...rows.map((row) => row.map((cell) => `"${cell}"`).join(',')),
+    ].join('\n');
+
+    const BOM = '\uFEFF';
+    const blob = new Blob([BOM + csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    const tgtPart =
+      newStudentExportTargetClass !== EXPORT_CLASS_FILTER_ALL
+        ? `_目标班_${sanitizeCsvFilenamePart(newStudentExportTargetClass)}`
+        : '';
+    const tgtYearPart =
+      newStudentExportTargetYear !== EXPORT_CLASS_FILTER_ALL
+        ? `_目标年份_${sanitizeCsvFilenamePart(newStudentExportTargetYear)}`
+        : '';
+    const tgtGradePart =
+      newStudentExportTargetGrade !== EXPORT_CLASS_FILTER_ALL
+        ? `_目标年级_${sanitizeCsvFilenamePart(newStudentExportTargetGrade)}`
+        : '';
+    link.download = `${result.to_term}_新生名单${tgtPart}${tgtYearPart}${tgtGradePart}_${formatZhDate(Date.now()).replace(/\//g, '-')}.csv`;
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -1152,11 +1514,11 @@ export default function Home() {
 
   if (!authUser) {
     return (
-      <div className="min-h-screen bg-gradient-to-br from-orange-50 via-amber-50 to-orange-100 dark:from-orange-950 dark:via-amber-950 dark:to-orange-900 flex items-center justify-center p-4">
-        <Card className="w-full max-w-md">
+      <div className="min-h-screen bg-gradient-to-br from-slate-200 via-blue-200 to-cyan-200 dark:from-slate-950 dark:via-blue-950 dark:to-cyan-950 flex items-center justify-center p-4">
+        <Card className="w-full max-w-md bg-gradient-to-br from-slate-200/95 via-slate-300/92 to-gray-300/90 dark:from-slate-800/95 dark:via-slate-700/90 dark:to-gray-700/88 backdrop-blur border-slate-400/35 dark:border-slate-600/35">
           <CardHeader>
-            <CardTitle className="text-blue-600">续班率统计系统登录</CardTitle>
-            <CardDescription>
+            <CardTitle className="text-blue-600 text-center text-3xl font-bold tracking-tight">续班率统计系统登录</CardTitle>
+            <CardDescription className="text-center">
               请先登录后再使用班级管理与续班率统计功能。
             </CardDescription>
           </CardHeader>
@@ -1167,22 +1529,24 @@ export default function Home() {
               </Alert>
             )}
             <div className="space-y-2">
-              <Label>账号</Label>
+              <Label className="text-lg font-bold text-slate-800 dark:text-slate-200">账号</Label>
               <Input
                 type="text"
                 placeholder="请输入账号（旧用户也可输入邮箱）"
                 value={authEmail}
                 onChange={(e) => setAuthEmail(e.target.value)}
+                className="h-11 text-xl font-semibold text-slate-800 dark:text-slate-100 placeholder:text-slate-500 dark:placeholder:text-slate-400"
               />
             </div>
             {authMode !== 'forgot' && (
               <div className="space-y-2">
-                <Label>密码</Label>
+                <Label className="text-lg font-bold text-slate-800 dark:text-slate-200">密码</Label>
                 <Input
                   type="password"
                   placeholder="请输入密码"
                   value={authPassword}
                   onChange={(e) => setAuthPassword(e.target.value)}
+                  className="h-11 text-xl font-semibold text-slate-800 dark:text-slate-100 placeholder:text-slate-500 dark:placeholder:text-slate-400"
                   onKeyDown={(e) => {
                     if (e.key === 'Enter' && !authSubmitting) void handleAuthSubmit();
                   }}
@@ -1224,24 +1588,24 @@ export default function Home() {
   }
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-orange-50 via-amber-50 to-orange-100 dark:from-orange-950 dark:via-amber-950 dark:to-orange-900">
+    <div className="min-h-screen bg-gradient-to-br from-slate-200 via-blue-200 to-cyan-200 dark:from-slate-950 dark:via-blue-950 dark:to-cyan-950">
       <div className="container mx-auto px-4 py-8 max-w-6xl">
         {/* 标题 */}
-        <div className="mb-8">
-          <div className="flex items-start justify-between gap-4">
-            <div className="text-center flex-1">
-              <h1 className="text-3xl font-bold text-blue-600 dark:text-blue-400 mb-2">
+        <div className="mb-10">
+          <div className="relative">
+            <div className="text-center">
+              <h1 className="text-5xl md:text-6xl font-bold text-blue-600 dark:text-blue-400 mb-3 tracking-tight">
                 续班率统计系统
               </h1>
               <p className="text-blue-500 dark:text-blue-500">
-                按学年、年级组织班级，上传点名册并计算续班率，支持排除半免和上课不足学生。
+                按学年、年级组织班级，上传点名册并计算续班率，支持排除免费/半免和上课不足学生。
               </p>
               <p className="text-xs text-slate-500 mt-2">
                 当前登录：{authUser.account || authUser.email || authUser.id}
                 {authUser.role ? `（${authUser.role === 'admin' ? '管理员' : '助教'}）` : ''}
               </p>
             </div>
-            <div className="flex flex-col gap-2 shrink-0">
+            <div className="hidden md:flex flex-col gap-2 shrink-0 absolute right-0 top-0">
               {authUser.role === 'admin' && (
                 <Button variant="outline" onClick={() => setShowCreateAssistant((v) => !v)} className="shrink-0">
                   添加助教
@@ -1255,6 +1619,20 @@ export default function Home() {
                 退出登录
               </Button>
             </div>
+          </div>
+          <div className="md:hidden mt-4 flex flex-wrap gap-2 justify-center">
+            {authUser.role === 'admin' && (
+              <Button variant="outline" onClick={() => setShowCreateAssistant((v) => !v)} className="shrink-0">
+                添加助教
+              </Button>
+            )}
+            <Button variant="outline" onClick={() => setShowChangePassword((v) => !v)} className="shrink-0">
+              修改密码
+            </Button>
+            <Button variant="outline" onClick={() => void handleLogout()} className="shrink-0">
+              <LogOut className="h-4 w-4 mr-2" />
+              退出登录
+            </Button>
           </div>
           {showChangePassword && (
             <Card className="mt-4 max-w-md ml-auto">
@@ -1288,7 +1666,10 @@ export default function Home() {
 
         {/* 消息提示 */}
         {message && (
-          <Alert className={`mb-6 ${message.type === 'success' ? 'border-green-500 bg-green-50 dark:bg-green-900/20' : 'border-red-500 bg-red-50 dark:bg-red-900/20'}`}>
+          <Alert
+            id="app-global-message"
+            className={`mb-6 ${message.type === 'success' ? 'border-green-500 bg-green-50 dark:bg-green-900/20' : 'border-red-500 bg-red-50 dark:bg-red-900/20'}`}
+          >
             {message.type === 'success' ? (
               <CheckCircle2 className="h-4 w-4 text-green-500" />
             ) : (
@@ -1344,7 +1725,7 @@ export default function Home() {
                     <label className="text-sm font-medium">学年 / 届次</label>
                     <Input
                       list="school-term-suggestions"
-                      placeholder="例如：2025学年、2024秋"
+                      placeholder="例如：26寒、26春、2025寒假"
                       value={term}
                       onChange={(e) => setTerm(e.target.value)}
                     />
@@ -1353,7 +1734,7 @@ export default function Home() {
                         <option key={t} value={t} />
                       ))}
                     </datalist>
-                    <p className="text-xs text-slate-500">与统计、续班对比中的「源 / 目标」一致；旧数据若仍用「寒假」等也可继续填写。</p>
+                    <p className="text-xs text-slate-500">请按统一格式填写：如 25秋、25寒、26春、2025寒假、春2026（用于按年份口径统计）。</p>
                   </div>
                   <div className="space-y-2">
                     <label className="text-sm font-medium">总课时数</label>
@@ -1368,7 +1749,25 @@ export default function Home() {
 
                 <div className="space-y-2">
                   <label className="text-sm font-medium">选择点名文件</label>
-                  <div className="border-2 border-dashed border-slate-200 dark:border-slate-700 rounded-lg p-8 text-center hover:border-slate-300 dark:hover:border-slate-600 transition-colors">
+                  <div
+                    className="border-2 border-dashed border-slate-200 dark:border-slate-700 rounded-lg p-8 text-center hover:border-slate-300 dark:hover:border-slate-600 transition-colors"
+                    onDragOver={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                    }}
+                    onDrop={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      const f = e.dataTransfer.files?.[0];
+                      if (!f) return;
+                      const lower = f.name.toLowerCase();
+                      if (!lower.endsWith('.xlsx') && !lower.endsWith('.xls') && !lower.endsWith('.csv')) {
+                        setMessage({ type: 'error', text: '请拖入 Excel（.xlsx / .xls）或 CSV 文件' });
+                        return;
+                      }
+                      setFile(f);
+                    }}
+                  >
                     <input
                       type="file"
                       accept=".xlsx,.xls,.csv"
@@ -1404,7 +1803,7 @@ export default function Home() {
                 </div>
 
                 <Button
-                  onClick={handleUpload}
+                  onClick={() => void handleUpload()}
                   disabled={uploading || !file || !className || !term}
                   className="w-full"
                 >
@@ -1420,6 +1819,11 @@ export default function Home() {
                     </>
                   )}
                 </Button>
+                {!uploading && (!file || !className || !term) ? (
+                  <p className="text-center text-xs text-amber-700 dark:text-amber-400">
+                    按钮为灰色时：请填写班级名称与学年/届次，并选择或拖入文件后再上传。
+                  </p>
+                ) : null}
               </CardContent>
             </Card>
 
@@ -1439,7 +1843,7 @@ export default function Home() {
                       </span>
                       <p className="text-sm text-slate-500 mt-2">整体续班率</p>
                     </div>
-                    <div className="grid grid-cols-2 md:grid-cols-5 gap-4 text-sm">
+                    <div className="grid grid-cols-2 md:grid-cols-6 gap-4 text-sm">
                       <div className="text-center">
                         <p className="text-slate-500">源班级数</p>
                         <p className="font-medium">{result.source_class_count}</p>
@@ -1459,6 +1863,10 @@ export default function Home() {
                       <div className="text-center">
                         <p className="text-slate-500">未续读人数</p>
                         <p className="font-medium text-red-600">{result.not_renewed_students}</p>
+                      </div>
+                      <div className="text-center">
+                        <p className="text-slate-500">新生人数</p>
+                        <p className="font-medium text-sky-600">{result.new_students ?? result.new_student_details?.length ?? 0}</p>
                       </div>
                     </div>
                   </div>
@@ -1563,6 +1971,10 @@ export default function Home() {
                       <Download className="h-4 w-4 mr-2" />
                       导出未续班名单
                     </Button>
+                    <Button variant="secondary" onClick={exportNewStudentList} disabled={!filteredNewStudentDetails.length}>
+                      <Download className="h-4 w-4 mr-2" />
+                      导出新生名单
+                    </Button>
                   </div>
                 </CardContent>
               </Card>
@@ -1575,48 +1987,93 @@ export default function Home() {
               <CardHeader>
                 <CardTitle className="text-blue-600">续班率统计</CardTitle>
                 <CardDescription>
-                  选择源学年与目标学年（届次），计算续班率；结果中可按年级查看班级明细。自动排除半免与上课不足总课时1/3的学生。
+                  选择源学年与目标学年（届次），计算续班率；结果中可按年级查看班级明细。自动排除免费/半免与上课不足总课时1/3的学生。
                 </CardDescription>
               </CardHeader>
               <CardContent className="space-y-6">
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  <div className="space-y-2">
-                    <label className="text-sm font-medium">源学年 / 届次</label>
-                    <Select value={fromTerm} onValueChange={setFromTerm}>
-                      <SelectTrigger>
-                        <SelectValue placeholder="请选择源学年" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {existingTerms.map((t) => (
-                          <SelectItem key={t} value={t}>
-                            {t}（{getTermClasses(t).length}个班级）
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
+                {statsYearOptions.length > 0 ? (
+                  <div className="space-y-3 rounded-lg border p-4 bg-slate-50/70 dark:bg-slate-900/30">
+                    <p className="text-sm text-slate-600 dark:text-slate-400">
+                      按“年份 + 口径”统计：支持秋升春、寒升春、秋寒升春。
+                    </p>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      <div className="space-y-2">
+                        <label className="text-sm font-medium">统计年份</label>
+                        <Select value={statYear} onValueChange={setStatYear}>
+                          <SelectTrigger>
+                            <SelectValue placeholder="请选择统计年份" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {statsYearOptions.map((y) => (
+                              <SelectItem key={`stat-year-${y}`} value={y}>
+                                {y}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      </div>
+                      <div className="space-y-2">
+                        <label className="text-sm font-medium">统计口径</label>
+                        <Select value={statPlan} onValueChange={(v: StatPlan) => setStatPlan(v)}>
+                          <SelectTrigger>
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="autumn_to_spring">秋升春</SelectItem>
+                            <SelectItem value="winter_to_spring">寒升春</SelectItem>
+                            <SelectItem value="autumn_winter_to_spring">秋寒升春</SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </div>
+                    </div>
+                    <p className="text-xs text-slate-500">
+                      当前口径使用源：{effectivePlanTerms.fromTerms.length ? effectivePlanTerms.fromTerms.join('、') : '—'}；
+                      目标：{effectivePlanTerms.toTerms.length ? effectivePlanTerms.toTerms.join('、') : '—'}
+                    </p>
+                    {effectivePlanTerms.autoDowngraded ? (
+                      <p className="text-xs text-amber-700 dark:text-amber-400">未检测到秋季源班，已自动切换为“寒升春”口径。</p>
+                    ) : null}
                   </div>
-                  <div className="space-y-2">
-                    <label className="text-sm font-medium">目标学年 / 届次（续读所在）</label>
-                    <Select value={toTerm} onValueChange={setToTerm}>
-                      <SelectTrigger>
-                        <SelectValue placeholder="请选择目标学年" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {existingTerms
-                          .filter((t) => t !== fromTerm)
-                          .map((t) => (
+                ) : (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div className="space-y-2">
+                      <label className="text-sm font-medium">源学年 / 届次</label>
+                      <Select value={fromTerm} onValueChange={setFromTerm}>
+                        <SelectTrigger>
+                          <SelectValue placeholder="请选择源学年" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {existingTerms.map((t) => (
                             <SelectItem key={t} value={t}>
                               {t}（{getTermClasses(t).length}个班级）
                             </SelectItem>
                           ))}
-                      </SelectContent>
-                    </Select>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-sm font-medium">目标学年 / 届次（续读所在）</label>
+                      <Select value={toTerm} onValueChange={setToTerm}>
+                        <SelectTrigger>
+                          <SelectValue placeholder="请选择目标学年" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {existingTerms
+                            .filter((t) => t !== fromTerm)
+                            .map((t) => (
+                              <SelectItem key={t} value={t}>
+                                {t}（{getTermClasses(t).length}个班级）
+                              </SelectItem>
+                            ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
                   </div>
-                </div>
+                )}
 
                 <Button
                   onClick={handleCalculate}
-                  disabled={calculating || !fromTerm || !toTerm}
+                  disabled={calculating || (statsYearOptions.length > 0 ? !statYear : (!fromTerm || !toTerm))}
                   className="w-full"
                 >
                   {calculating ? (
@@ -1664,6 +2121,10 @@ export default function Home() {
                         <div>
                           <span className="text-slate-500">未续读人数：</span>
                           <span className="font-medium text-red-600">{result.not_renewed_students}</span>
+                        </div>
+                        <div>
+                          <span className="text-slate-500">新生人数：</span>
+                          <span className="font-medium text-sky-600">{result.new_students ?? result.new_student_details?.length ?? 0}</span>
                         </div>
                       </div>
                     </div>
@@ -1789,7 +2250,7 @@ export default function Home() {
                           </Button>
                         </div>
                         <p className="text-sm text-slate-500 mb-2">
-                          可按源班级与续读所在目标班级筛选，导出文件名会带上筛选条件。
+                          可按源班级/源年级与续读目标班级/目标年级筛选，导出文件名会带上筛选条件。
                         </p>
                         <div className="flex flex-wrap gap-3 mb-3">
                           <div className="flex flex-col gap-1 min-w-[200px]">
@@ -1809,6 +2270,22 @@ export default function Home() {
                             </Select>
                           </div>
                           <div className="flex flex-col gap-1 min-w-[200px]">
+                            <span className="text-xs text-slate-500">源年级</span>
+                            <Select value={renewedExportSourceGrade} onValueChange={setRenewedExportSourceGrade}>
+                              <SelectTrigger className="w-full sm:w-[240px]">
+                                <SelectValue placeholder="全部源年级" />
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value={EXPORT_CLASS_FILTER_ALL}>全部源年级</SelectItem>
+                                {renewedExportSourceGradeOptions.map((grade) => (
+                                  <SelectItem key={`stat-r-src-g-${grade}`} value={grade}>
+                                    {grade}
+                                  </SelectItem>
+                                ))}
+                              </SelectContent>
+                            </Select>
+                          </div>
+                          <div className="flex flex-col gap-1 min-w-[200px]">
                             <span className="text-xs text-slate-500">续读所在目标学年班级</span>
                             <Select value={renewedExportTargetClass} onValueChange={setRenewedExportTargetClass}>
                               <SelectTrigger className="w-full sm:w-[240px]">
@@ -1819,6 +2296,22 @@ export default function Home() {
                                 {renewedExportTargetOptions.map((name) => (
                                   <SelectItem key={name} value={name}>
                                     {name}
+                                  </SelectItem>
+                                ))}
+                              </SelectContent>
+                            </Select>
+                          </div>
+                          <div className="flex flex-col gap-1 min-w-[200px]">
+                            <span className="text-xs text-slate-500">目标年级</span>
+                            <Select value={renewedExportTargetGrade} onValueChange={setRenewedExportTargetGrade}>
+                              <SelectTrigger className="w-full sm:w-[240px]">
+                                <SelectValue placeholder="全部目标年级" />
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value={EXPORT_CLASS_FILTER_ALL}>全部目标年级</SelectItem>
+                                {renewedExportTargetGradeOptions.map((grade) => (
+                                  <SelectItem key={`stat-r-tgt-g-${grade}`} value={grade}>
+                                    {grade}
                                   </SelectItem>
                                 ))}
                               </SelectContent>
@@ -1882,7 +2375,7 @@ export default function Home() {
                             导出 CSV
                           </Button>
                         </div>
-                        <p className="text-sm text-slate-500 mb-2">可按源班级筛选后导出。</p>
+                        <p className="text-sm text-slate-500 mb-2">可按源班级/源年级筛选后导出。</p>
                         <div className="flex flex-wrap gap-3 mb-3">
                           <div className="flex flex-col gap-1 min-w-[200px]">
                             <span className="text-xs text-slate-500">源班级（源学年）</span>
@@ -1895,6 +2388,22 @@ export default function Home() {
                                 {notRenewedExportSourceOptions.map((name) => (
                                   <SelectItem key={name} value={name}>
                                     {name}
+                                  </SelectItem>
+                                ))}
+                              </SelectContent>
+                            </Select>
+                          </div>
+                          <div className="flex flex-col gap-1 min-w-[200px]">
+                            <span className="text-xs text-slate-500">源年级</span>
+                            <Select value={notRenewedExportSourceGrade} onValueChange={setNotRenewedExportSourceGrade}>
+                              <SelectTrigger className="w-full sm:w-[240px]">
+                                <SelectValue placeholder="全部源年级" />
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value={EXPORT_CLASS_FILTER_ALL}>全部源年级</SelectItem>
+                                {notRenewedExportSourceGradeOptions.map((grade) => (
+                                  <SelectItem key={`stat-nr-src-g-${grade}`} value={grade}>
+                                    {grade}
                                   </SelectItem>
                                 ))}
                               </SelectContent>
@@ -1919,6 +2428,94 @@ export default function Home() {
                               <TableBody>
                                 {filteredNotRenewedDetails.map((student, index) => (
                                   <TableRow key={student.student_id}>
+                                    <TableCell>{index + 1}</TableCell>
+                                    <TableCell className="font-medium">{student.name}</TableCell>
+                                    <TableCell>{student.class_name}</TableCell>
+                                    <TableCell className="text-center">{student.lessons_attended}</TableCell>
+                                    <TableCell className="text-center">{student.total_lessons}</TableCell>
+                                    <TableCell className="text-center">
+                                      {((student.lessons_attended / student.total_lessons) * 100).toFixed(0)}%
+                                    </TableCell>
+                                  </TableRow>
+                                ))}
+                              </TableBody>
+                            </Table>
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {/* 新生明细 */}
+                    {result.new_student_details && result.new_student_details.length > 0 && (
+                      <div>
+                        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between mb-3">
+                          <h4 className="font-medium text-sky-700 flex items-center gap-2">
+                            <Users className="h-4 w-4" />
+                            新生名单（共 {result.new_student_details.length} 人，当前显示 {filteredNewStudentDetails.length} 人）
+                          </h4>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={exportNewStudentList}
+                            disabled={!filteredNewStudentDetails.length}
+                          >
+                            <Download className="h-4 w-4 mr-1" />
+                            导出 CSV
+                          </Button>
+                        </div>
+                        <p className="text-sm text-slate-500 mb-2">可按目标班级/目标年级筛选后导出。</p>
+                        <div className="flex flex-wrap gap-3 mb-3">
+                          <div className="flex flex-col gap-1 min-w-[200px]">
+                            <span className="text-xs text-slate-500">目标班级（目标学年）</span>
+                            <Select value={newStudentExportTargetClass} onValueChange={setNewStudentExportTargetClass}>
+                              <SelectTrigger className="w-full sm:w-[240px]">
+                                <SelectValue placeholder="全部目标班级" />
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value={EXPORT_CLASS_FILTER_ALL}>全部目标班级</SelectItem>
+                                {newStudentExportTargetOptions.map((name) => (
+                                  <SelectItem key={`new-${name}`} value={name}>
+                                    {name}
+                                  </SelectItem>
+                                ))}
+                              </SelectContent>
+                            </Select>
+                          </div>
+                          <div className="flex flex-col gap-1 min-w-[200px]">
+                            <span className="text-xs text-slate-500">目标年级</span>
+                            <Select value={newStudentExportTargetGrade} onValueChange={setNewStudentExportTargetGrade}>
+                              <SelectTrigger className="w-full sm:w-[240px]">
+                                <SelectValue placeholder="全部目标年级" />
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value={EXPORT_CLASS_FILTER_ALL}>全部目标年级</SelectItem>
+                                {newStudentExportTargetGradeOptions.map((grade) => (
+                                  <SelectItem key={`stat-new-tgt-g-${grade}`} value={grade}>
+                                    {grade}
+                                  </SelectItem>
+                                ))}
+                              </SelectContent>
+                            </Select>
+                          </div>
+                        </div>
+                        {filteredNewStudentDetails.length === 0 ? (
+                          <p className="text-sm text-amber-700 dark:text-amber-400 py-4">当前筛选条件下没有学生，请调整筛选项。</p>
+                        ) : (
+                          <div className="border border-sky-200 dark:border-sky-800 rounded-lg overflow-hidden max-h-96 overflow-y-auto bg-sky-50/50 dark:bg-sky-900/10">
+                            <Table>
+                              <TableHeader>
+                                <TableRow>
+                                  <TableHead>序号</TableHead>
+                                  <TableHead>姓名</TableHead>
+                                  <TableHead>目标班级</TableHead>
+                                  <TableHead className="text-center">已上课时</TableHead>
+                                  <TableHead className="text-center">总课时</TableHead>
+                                  <TableHead className="text-center">出勤率</TableHead>
+                                </TableRow>
+                              </TableHeader>
+                              <TableBody>
+                                {filteredNewStudentDetails.map((student, index) => (
+                                  <TableRow key={`new-${student.student_id}`}>
                                     <TableCell>{index + 1}</TableCell>
                                     <TableCell className="font-medium">{student.name}</TableCell>
                                     <TableCell>{student.class_name}</TableCell>
@@ -2236,7 +2833,7 @@ export default function Home() {
                       <p className="text-slate-500">整体续班率</p>
                     </div>
 
-                    <div className="grid grid-cols-5 gap-4">
+                    <div className="grid grid-cols-2 md:grid-cols-6 gap-4">
                       <div className="text-center p-4 bg-slate-50 dark:bg-slate-800 rounded-lg">
                         <div className="text-2xl font-bold">{result.source_class_count}</div>
                         <div className="text-sm text-slate-500">源班级数</div>
@@ -2256,6 +2853,10 @@ export default function Home() {
                       <div className="text-center p-4 bg-red-50 dark:bg-red-900/20 rounded-lg">
                         <div className="text-2xl font-bold text-red-600">{result.not_renewed_students}</div>
                         <div className="text-sm text-slate-500">未续读人数</div>
+                      </div>
+                      <div className="text-center p-4 bg-sky-50 dark:bg-sky-900/20 rounded-lg">
+                        <div className="text-2xl font-bold text-sky-600">{result.new_students ?? result.new_student_details?.length ?? 0}</div>
+                        <div className="text-sm text-slate-500">新生人数</div>
                       </div>
                     </div>
 
@@ -2338,7 +2939,7 @@ export default function Home() {
 
                     <div className="rounded-lg border bg-slate-50/80 dark:bg-slate-900/30 p-4 space-y-3 mb-4">
                       <p className="text-sm text-slate-600 dark:text-slate-400">
-                        导出前可按班级筛选；续读名单支持源班级 + 续读目标班级组合筛选。
+                        导出前可按班级/年级筛选；续读名单支持源班级(年级) + 续读目标班级(年级)组合筛选。
                       </p>
                       <div className="flex flex-wrap gap-3">
                         <div className="flex flex-col gap-1 min-w-[180px]">
@@ -2352,6 +2953,22 @@ export default function Home() {
                               {renewedExportSourceOptions.map((name) => (
                                 <SelectItem key={`r-src-${name}`} value={name}>
                                   {name}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                        </div>
+                        <div className="flex flex-col gap-1 min-w-[180px]">
+                          <span className="text-xs text-slate-500">续读·源年级</span>
+                          <Select value={renewedExportSourceGrade} onValueChange={setRenewedExportSourceGrade}>
+                            <SelectTrigger className="w-full sm:w-[220px]">
+                              <SelectValue placeholder="全部源年级" />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value={EXPORT_CLASS_FILTER_ALL}>全部源年级</SelectItem>
+                              {renewedExportSourceGradeOptions.map((grade) => (
+                                <SelectItem key={`r-src-g-${grade}`} value={grade}>
+                                  {grade}
                                 </SelectItem>
                               ))}
                             </SelectContent>
@@ -2374,6 +2991,22 @@ export default function Home() {
                           </Select>
                         </div>
                         <div className="flex flex-col gap-1 min-w-[180px]">
+                          <span className="text-xs text-slate-500">续读·目标年级</span>
+                          <Select value={renewedExportTargetGrade} onValueChange={setRenewedExportTargetGrade}>
+                            <SelectTrigger className="w-full sm:w-[220px]">
+                              <SelectValue placeholder="全部目标年级" />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value={EXPORT_CLASS_FILTER_ALL}>全部目标年级</SelectItem>
+                              {renewedExportTargetGradeOptions.map((grade) => (
+                                <SelectItem key={`r-tgt-g-${grade}`} value={grade}>
+                                  {grade}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                        </div>
+                        <div className="flex flex-col gap-1 min-w-[180px]">
                           <span className="text-xs text-slate-500">未续班·源班级</span>
                           <Select value={notRenewedExportSourceClass} onValueChange={setNotRenewedExportSourceClass}>
                             <SelectTrigger className="w-full sm:w-[220px]">
@@ -2389,13 +3022,61 @@ export default function Home() {
                             </SelectContent>
                           </Select>
                         </div>
+                        <div className="flex flex-col gap-1 min-w-[180px]">
+                          <span className="text-xs text-slate-500">未续班·源年级</span>
+                          <Select value={notRenewedExportSourceGrade} onValueChange={setNotRenewedExportSourceGrade}>
+                            <SelectTrigger className="w-full sm:w-[220px]">
+                              <SelectValue placeholder="全部源年级" />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value={EXPORT_CLASS_FILTER_ALL}>全部源年级</SelectItem>
+                              {notRenewedExportSourceGradeOptions.map((grade) => (
+                                <SelectItem key={`nr-src-g-${grade}`} value={grade}>
+                                  {grade}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                        </div>
+                        <div className="flex flex-col gap-1 min-w-[180px]">
+                          <span className="text-xs text-slate-500">新生·目标班级</span>
+                          <Select value={newStudentExportTargetClass} onValueChange={setNewStudentExportTargetClass}>
+                            <SelectTrigger className="w-full sm:w-[220px]">
+                              <SelectValue placeholder="全部目标班级" />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value={EXPORT_CLASS_FILTER_ALL}>全部目标班级</SelectItem>
+                              {newStudentExportTargetOptions.map((name) => (
+                                <SelectItem key={`new-tgt-${name}`} value={name}>
+                                  {name}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                        </div>
+                        <div className="flex flex-col gap-1 min-w-[180px]">
+                          <span className="text-xs text-slate-500">新生·目标年级</span>
+                          <Select value={newStudentExportTargetGrade} onValueChange={setNewStudentExportTargetGrade}>
+                            <SelectTrigger className="w-full sm:w-[220px]">
+                              <SelectValue placeholder="全部目标年级" />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value={EXPORT_CLASS_FILTER_ALL}>全部目标年级</SelectItem>
+                              {newStudentExportTargetGradeOptions.map((grade) => (
+                                <SelectItem key={`new-tgt-g-${grade}`} value={grade}>
+                                  {grade}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                        </div>
                       </div>
                       <p className="text-xs text-slate-500">
-                        当前可导出：续读 {filteredRenewedDetails.length} 人 · 未续班 {filteredNotRenewedDetails.length} 人
+                        当前可导出：续读 {filteredRenewedDetails.length} 人 · 未续班 {filteredNotRenewedDetails.length} 人 · 新生 {filteredNewStudentDetails.length} 人
                       </p>
                     </div>
 
-                    <div className="flex gap-4">
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                       <Button
                         variant="outline"
                         onClick={exportRenewedList}
@@ -2413,6 +3094,15 @@ export default function Home() {
                       >
                         <Download className="h-4 w-4 mr-2" />
                         导出未续班名单
+                      </Button>
+                      <Button
+                        variant="secondary"
+                        onClick={exportNewStudentList}
+                        disabled={!filteredNewStudentDetails.length}
+                        className="flex-1"
+                      >
+                        <Download className="h-4 w-4 mr-2" />
+                        导出新生名单
                       </Button>
                     </div>
 
@@ -2587,7 +3277,7 @@ export default function Home() {
                             <TableHead className="text-center">已上课时</TableHead>
                             <TableHead className="text-center">总课时</TableHead>
                             <TableHead className="text-center">出勤率</TableHead>
-                            <TableHead className="text-center">半免</TableHead>
+                            <TableHead className="text-center">优惠/免费排除</TableHead>
                             <TableHead className="text-center w-24">操作</TableHead>
                           </TableRow>
                         </TableHeader>

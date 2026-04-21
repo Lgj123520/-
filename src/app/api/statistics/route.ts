@@ -2,13 +2,52 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getSupabaseClient } from '@/storage/database/supabase-client';
 import { compareGradeLabels, extractGradeFromClassName } from '@/lib/class-grade';
 
+function pickNameField(v: { name?: string } | { name?: string }[] | null | undefined): string {
+  if (!v) return '未知';
+  if (Array.isArray(v)) return v[0]?.name || '未知';
+  return v.name || '未知';
+}
+
+function pickTotalLessonsField(
+  v: { total_lessons?: number } | { total_lessons?: number }[] | null | undefined,
+  fallback = 12
+): number {
+  if (!v) return fallback;
+  if (Array.isArray(v)) return v[0]?.total_lessons || fallback;
+  return v.total_lessons || fallback;
+}
+
 export async function POST(request: NextRequest) {
   try {
-    const { fromTerm, toTerm } = await request.json();
+    const {
+      fromTerm,
+      toTerm,
+      fromTerms,
+      toTerms,
+      sourceClassIds: sourceClassIdsParam,
+      targetClassIds: targetClassIdsParam,
+      fromTermLabel,
+      toTermLabel,
+    } = await request.json();
 
-    if (!fromTerm || !toTerm) {
+    const sourceTerms: string[] = Array.isArray(fromTerms) && fromTerms.length
+      ? fromTerms
+      : fromTerm
+      ? [fromTerm]
+      : [];
+    const targetTerms: string[] = Array.isArray(toTerms) && toTerms.length
+      ? toTerms
+      : toTerm
+      ? [toTerm]
+      : [];
+
+    const sourceIds: string[] = Array.isArray(sourceClassIdsParam) ? sourceClassIdsParam.filter(Boolean) : [];
+    const targetIds: string[] = Array.isArray(targetClassIdsParam) ? targetClassIdsParam.filter(Boolean) : [];
+
+    const hasClassScope = sourceIds.length > 0 || targetIds.length > 0;
+    if (!hasClassScope && (sourceTerms.length === 0 || targetTerms.length === 0)) {
       return NextResponse.json(
-        { error: '缺少必要参数：fromTerm, toTerm' },
+        { error: '缺少必要参数：fromTerm/toTerm、fromTerms/toTerms，或 sourceClassIds/targetClassIds' },
         { status: 400 }
       );
     }
@@ -16,18 +55,17 @@ export async function POST(request: NextRequest) {
     const supabase = getSupabaseClient();
 
     // 1. 获取源学期（如"寒假"）的所有班级
-    const { data: sourceClasses, error: sourceError } = await supabase
-      .from('classes')
-      .select('*')
-      .eq('term', fromTerm);
+    const sourceQuery = supabase.from('classes').select('*');
+    const { data: sourceClasses, error: sourceError } =
+      sourceIds.length > 0 ? await sourceQuery.in('id', sourceIds) : await sourceQuery.in('term', sourceTerms);
 
     if (sourceError) throw new Error(`获取源班级失败: ${sourceError.message}`);
 
     if (!sourceClasses || sourceClasses.length === 0) {
       return NextResponse.json({
         data: {
-          from_term: fromTerm,
-          to_term: toTerm,
+          from_term: fromTermLabel || (sourceTerms.length ? sourceTerms.join('、') : '源范围'),
+          to_term: toTermLabel || (targetTerms.length ? targetTerms.join('、') : '目标范围'),
           source_class_count: 0,
           source_total_students: 0,
           valid_students: 0, // 排除半免和上课不足1/3后的有效学生数
@@ -41,10 +79,9 @@ export async function POST(request: NextRequest) {
     }
 
     // 2. 获取目标学期（如"春季"）的所有班级
-    const { data: targetClasses, error: targetError } = await supabase
-      .from('classes')
-      .select('*')
-      .eq('term', toTerm);
+    const targetQuery = supabase.from('classes').select('*');
+    const { data: targetClasses, error: targetError } =
+      targetIds.length > 0 ? await targetQuery.in('id', targetIds) : await targetQuery.in('term', targetTerms);
 
     if (targetError) throw new Error(`获取目标班级失败: ${targetError.message}`);
 
@@ -57,6 +94,7 @@ export async function POST(request: NextRequest) {
       .in('class_id', sourceClassIds);
 
     if (recordsError) throw new Error(`获取点名记录失败: ${recordsError.message}`);
+    const sourceAllStudentIds = new Set<string>((sourceRecords || []).map((r) => r.student_id));
 
     // 4. 计算源学期有效学生（排除半免 + 上课不足1/3）
     const validSourceStudentIds = new Set<string>();
@@ -87,11 +125,12 @@ export async function POST(request: NextRequest) {
       (targetClasses || []).map((c) => [c.id, c.name])
     );
     const renewedToClassNamesByStudent = new Map<string, Set<string>>();
+    const targetStudentDetails = new Map<string, { name: string; lessons_attended: number; total_lessons: number }>();
 
     if (targetClasses.length > 0) {
       const { data: targetRecords, error: targetRecordsError } = await supabase
         .from('attendance_records')
-        .select('student_id, class_id')
+        .select('student_id, class_id, lessons_attended, students(name), classes(total_lessons)')
         .in('class_id', targetClassIds);
 
       if (targetRecordsError) throw new Error(`获取目标班级记录失败: ${targetRecordsError.message}`);
@@ -106,6 +145,17 @@ export async function POST(request: NextRequest) {
           renewedToClassNamesByStudent.set(record.student_id, set);
         }
         set.add(cname);
+        if (!targetStudentDetails.has(record.student_id)) {
+          const totalLessons = pickTotalLessonsField(
+            record.classes as { total_lessons?: number } | { total_lessons?: number }[] | null,
+            12
+          );
+          targetStudentDetails.set(record.student_id, {
+            name: pickNameField(record.students as { name?: string } | { name?: string }[] | null),
+            lessons_attended: Math.min(record.lessons_attended, totalLessons),
+            total_lessons: totalLessons,
+          });
+        }
       }
     }
 
@@ -123,7 +173,9 @@ export async function POST(request: NextRequest) {
       lessons_attended: number;
       total_lessons: number;
       class_name?: string;
+      source_term?: string;
       renewed_to_class?: string;
+      target_term?: string;
     }[] = [];
     const notRenewedDetails: {
       student_id: string;
@@ -131,6 +183,15 @@ export async function POST(request: NextRequest) {
       lessons_attended: number;
       total_lessons: number;
       class_name: string;
+      source_term?: string;
+    }[] = [];
+    const newStudentDetails: {
+      student_id: string;
+      name: string;
+      lessons_attended: number;
+      total_lessons: number;
+      class_name: string;
+      target_term?: string;
     }[] = [];
 
     // 获取学生对应的班级信息
@@ -155,15 +216,33 @@ export async function POST(request: NextRequest) {
           student_id: studentId,
           ...sourceStudentDetails[studentId],
           class_name: studentClassMap[studentId],
+          source_term: sourceTerms.join('、'),
           renewed_to_class: getRenewedToClassLabel(studentId),
+          target_term: targetTerms.join('、'),
         });
       } else {
         notRenewedDetails.push({
           student_id: studentId,
           ...sourceStudentDetails[studentId],
           class_name: studentClassMap[studentId] || '未知班级',
+          source_term: sourceTerms.join('、'),
         });
       }
+    }
+
+    // 6.5 计算新生：目标学期有、源学期没有（按学生ID）
+    for (const studentId of targetStudentIds) {
+      if (sourceAllStudentIds.has(studentId)) continue;
+      const detail = targetStudentDetails.get(studentId);
+      if (!detail) continue;
+      newStudentDetails.push({
+        student_id: studentId,
+        name: detail.name,
+        lessons_attended: detail.lessons_attended,
+        total_lessons: detail.total_lessons,
+        class_name: getRenewedToClassLabel(studentId) || '未知班级',
+        target_term: targetTerms.join('、'),
+      });
     }
 
     // 7. 统计每个源班级的情况（含从班级名称解析的年级，便于按年级分层）
@@ -233,16 +312,26 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json({
       data: {
-        from_term: fromTerm,
-        to_term: toTerm,
+        from_term:
+          fromTermLabel ||
+          (sourceIds.length > 0
+            ? [...new Set((sourceClasses || []).map((c) => c.term))].join('、')
+            : sourceTerms.join('、')),
+        to_term:
+          toTermLabel ||
+          (targetIds.length > 0
+            ? [...new Set((targetClasses || []).map((c) => c.term))].join('、')
+            : targetTerms.join('、')),
         source_class_count: sourceClasses.length,
         source_total_students: sourceRecords?.length || 0,
         valid_students: validTotal,
         renewed_students: renewedCount,
         not_renewed_students: validTotal - renewedCount,
+        new_students: newStudentDetails.length,
         renewal_rate: renewalRate.toFixed(1) + '%',
         renewed_details: renewedDetails,
         not_renewed_details: notRenewedDetails,
+        new_student_details: newStudentDetails,
         class_stats: classStats,
         grade_stats,
       },

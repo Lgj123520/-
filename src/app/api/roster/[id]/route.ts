@@ -39,7 +39,8 @@ export async function GET(
       const isExcluded = record.is_half_free || isExcludedByAttendance;
       let remark = '';
       if (record.is_half_free) {
-        remark = '半免';
+        const rawRemark = String((record as { remark?: string | null }).remark || '').trim();
+        remark = rawRemark.includes('免费') || rawRemark.includes('全免') ? '免费' : '半免';
       } else if (lessonsAttended === 0) {
         remark = '退费/退班';
       } else if (isExcludedByAttendance) {
