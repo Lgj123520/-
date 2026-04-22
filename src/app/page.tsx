@@ -16,7 +16,6 @@ import { Label } from '@/components/ui/label';
 import { Upload, BarChart3, FileSpreadsheet, CheckCircle2, XCircle, Loader2, Download, UserX, Users, UserCheck, Eye, Trash2, Edit, Search, X, Pencil, LogOut } from 'lucide-react';
 import { compareGradeLabels, extractGradeFromClassName } from '@/lib/class-grade';
 import { compareSchoolYearLabels, groupClassesBySchoolYearAndGrade } from '@/lib/class-org';
-import * as XLSX from 'xlsx';
 
 /** 上传「学年/届次」输入框的下拉建议（可与已有数据合并） */
 const SCHOOL_TERM_SUGGESTIONS = [
@@ -906,6 +905,7 @@ export default function Home() {
     try {
       const totalLessonsNum = Math.max(1, parseInt(totalLessons, 10) || 12);
       const buffer = await nextFile.arrayBuffer();
+      const XLSX = await import('xlsx');
       const workbook = XLSX.read(new Uint8Array(buffer), { type: 'array' });
       const sheetName = workbook.SheetNames[0];
       if (!sheetName) {
@@ -938,8 +938,7 @@ export default function Home() {
     }
     setFile(nextFile);
     setShowAllUploadPreviewRows(false);
-    void parseUploadPreview(nextFile);
-  }, [parseUploadPreview]);
+  }, []);
 
   useEffect(() => {
     if (!file) return;
@@ -1685,7 +1684,7 @@ export default function Home() {
       <div className="min-h-screen bg-gradient-to-br from-slate-200 via-blue-200 to-cyan-200 dark:from-slate-950 dark:via-blue-950 dark:to-cyan-950 flex items-center justify-center p-4">
         <Card className="w-full max-w-md bg-gradient-to-br from-slate-100/95 via-blue-100/90 to-indigo-100/88 dark:from-slate-900/92 dark:via-slate-800/86 dark:to-indigo-950/78 border-slate-300/55 dark:border-slate-600/60 shadow-[0_20px_50px_-28px_rgba(37,99,235,0.45)]">
           <CardHeader>
-            <CardTitle className="text-center text-3xl font-bold tracking-tight bg-gradient-to-r from-blue-700 via-indigo-600 to-violet-600 bg-clip-text text-transparent dark:from-blue-300 dark:via-indigo-300 dark:to-violet-300">续班率统计系统登录</CardTitle>
+            <CardTitle className="text-center text-3xl font-bold tracking-tight bg-gradient-to-r from-violet-700 via-purple-600 to-fuchsia-600 bg-clip-text text-transparent dark:from-violet-300 dark:via-purple-300 dark:to-fuchsia-300">续班率统计系统登录</CardTitle>
             <CardDescription className="text-center">
               请先登录后再使用班级管理与续班率统计功能。
             </CardDescription>
@@ -1762,7 +1761,7 @@ export default function Home() {
         <div className="mb-10">
           <div className="relative">
             <div className="text-center">
-              <h1 className="text-5xl md:text-6xl font-bold mb-3 tracking-tight bg-gradient-to-r from-sky-700 via-blue-700 to-indigo-700 dark:from-sky-300 dark:via-blue-300 dark:to-indigo-300 bg-clip-text text-transparent drop-shadow-[0_3px_10px_rgba(30,64,175,0.22)]">
+              <h1 className="text-5xl md:text-6xl font-bold mb-3 tracking-tight bg-gradient-to-r from-violet-700 via-purple-600 to-fuchsia-600 dark:from-violet-300 dark:via-purple-300 dark:to-fuchsia-300 bg-clip-text text-transparent drop-shadow-[0_3px_10px_rgba(91,33,182,0.22)]">
                 续班率统计系统
               </h1>
               <p className="text-blue-500 dark:text-blue-500">
