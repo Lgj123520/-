@@ -181,6 +181,8 @@ interface ClassDetail {
   name: string;
   lessons_attended: number;
   is_half_free: boolean;
+  /** 后端写入：无备注列时仍可依此区分免费（与列表筛选「仅免费」一致） */
+  is_full_free?: boolean;
   is_excluded: boolean;
   remark: string;
   original_remark?: string;
@@ -832,7 +834,17 @@ export default function Home() {
         headerStr.includes('lessons')
       ) {
         lessonsIndex = index;
-      } else if (headerStr.includes('备注') || headerStr.includes('remark') || headerStr.includes('note') || headerStr.includes('说明')) {
+      } else if (
+        headerStr.includes('备注') ||
+        headerStr.includes('remark') ||
+        headerStr.includes('note') ||
+        headerStr.includes('说明') ||
+        headerStr.includes('标签') ||
+        headerStr.includes('类型') ||
+        headerStr.includes('学费') ||
+        headerStr.includes('缴费') ||
+        headerStr.includes('性质')
+      ) {
         remarkIndex = index;
       } else if (headerStr.includes('半免') || headerStr.includes('优惠') || headerStr.includes('折扣') || headerStr.includes('half')) {
         halfFreeIndex = index;
@@ -842,7 +854,21 @@ export default function Home() {
     if (nameIndex === -1) nameIndex = 0;
     if (lessonsIndex === -1) lessonsIndex = 1;
 
-    const freeKeywords = ['免费', '全免', '免学费'];
+    const combinedAuxiliaryCells = (
+      row: (string | number | boolean | null)[],
+      ni: number,
+      li: number
+    ) => {
+      const parts: string[] = [];
+      for (let j = 0; j < row.length; j++) {
+        if (j === ni || j === li) continue;
+        const cell = String(row[j] ?? '').trim();
+        if (cell) parts.push(cell);
+      }
+      return parts.join(' ');
+    };
+
+    const freeKeywords = ['免费', '全免', '免学费', '减免'];
     const halfFreeKeywords = ['半免', '优惠', '折扣', 'half'];
     const withdrawKeywords = ['退费', '试听', '休学', '退学', '退款', '取消', '退班', '退'];
     const rows: UploadPreviewRow[] = [];
@@ -860,7 +886,8 @@ export default function Home() {
 
       const remarkValue = remarkIndex >= 0 && remarkIndex < row.length ? String(row[remarkIndex] || '').trim() : '';
       const halfFreeValue = halfFreeIndex >= 0 && halfFreeIndex < row.length ? String(row[halfFreeIndex] || '').trim() : '';
-      const text = `${remarkValue} ${halfFreeValue}`.toLowerCase();
+      const combinedNotes = combinedAuxiliaryCells(row, nameIndex, lessonsIndex);
+      const text = `${combinedNotes} ${halfFreeValue}`.toLowerCase();
 
       const isWithdraw = withdrawKeywords.some((k) => text.includes(k.toLowerCase()));
       const isFree = freeKeywords.some((k) => text.includes(k.toLowerCase()));
@@ -1507,15 +1534,37 @@ export default function Home() {
     setEditedStudent(null);
   };
 
-  // 筛选学生
+  // 筛选学生：免费认「展示备注 / is_full_free / 原始备注含全免关键词」；避免仅认展示列导致筛不到历史数据
   const filteredStudents = selectedClass?.students.filter((student) => {
     const matchSearch = student.name.toLowerCase().includes(searchTerm.toLowerCase());
     const normalizedRemark = String(student.remark || '').trim();
-    const matchFilter = studentFilter === 'all' || 
+    const rawLower = String(student.original_remark || '').toLowerCase();
+    const looksFreeByOriginal =
+      rawLower.includes('免费') ||
+      rawLower.includes('全免') ||
+      rawLower.includes('免学费') ||
+      rawLower.includes('减免');
+    const looksHalfByOriginal =
+      rawLower.includes('半免') ||
+      rawLower.includes('优惠') ||
+      rawLower.includes('折扣') ||
+      /\bhalf\b/.test(rawLower);
+    const matchFree =
+      normalizedRemark === '免费' ||
+      !!student.is_full_free ||
+      (student.is_half_free && looksFreeByOriginal);
+    const matchHalfFree =
+      normalizedRemark === '半免' ||
+      (student.is_half_free &&
+        !student.is_full_free &&
+        !looksFreeByOriginal &&
+        looksHalfByOriginal);
+    const matchFilter =
+      studentFilter === 'all' ||
       (studentFilter === 'normal' && !student.is_excluded) ||
       (studentFilter === 'excluded' && student.is_excluded) ||
-      (studentFilter === 'free' && normalizedRemark === '免费') ||
-      (studentFilter === 'half_free' && normalizedRemark === '半免') ||
+      (studentFilter === 'free' && matchFree) ||
+      (studentFilter === 'half_free' && matchHalfFree) ||
       (studentFilter === 'withdraw' && normalizedRemark === '退费/退班') ||
       (studentFilter === 'low_attendance' && normalizedRemark === '课时不足');
     return matchSearch && matchFilter;

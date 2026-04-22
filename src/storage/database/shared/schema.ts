@@ -45,7 +45,8 @@ export const attendanceRecords = pgTable(
 		class_id: varchar("class_id", { length: 36 }).notNull().references(() => classes.id),
 		student_id: varchar("student_id", { length: 36 }).notNull().references(() => students.id),
 		lessons_attended: integer("lessons_attended").notNull().default(0), // 已上课时数
-		is_half_free: boolean("is_half_free").notNull().default(false), // 是否半免
+		is_half_free: boolean("is_half_free").notNull().default(false), // 是否因学费优惠类需排除（半免或全免均为 true）
+		is_full_free: boolean("is_full_free").notNull().default(false), // 是否全免/免费（与 is_half_free 联用；无 remark 列时靠此区分展示）
 		created_at: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 		updated_at: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
 	},

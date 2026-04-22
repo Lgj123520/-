@@ -38,9 +38,12 @@ export async function GET(
       const isExcludedByAttendance = lessonsAttended < oneThird;
       const isExcluded = record.is_half_free || isExcludedByAttendance;
       let remark = '';
+      const row = record as { remark?: string | null; is_full_free?: boolean };
+      const isFullFreeDb = !!(row.is_full_free ?? false);
       if (record.is_half_free) {
-        const rawRemark = String((record as { remark?: string | null }).remark || '').trim();
+        const rawRemark = String(row.remark || '').trim();
         const isFreeLike =
+          isFullFreeDb ||
           rawRemark.includes('免费') ||
           rawRemark.includes('全免') ||
           rawRemark.includes('免学费') ||
@@ -57,9 +60,10 @@ export async function GET(
         name: record.students?.name || '未知',
         lessons_attended: record.lessons_attended,
         is_half_free: !!record.is_half_free,
+        is_full_free: isFullFreeDb,
         is_excluded: isExcluded,
         remark: remark,
-        original_remark: String((record as { remark?: string | null }).remark || ''),
+        original_remark: String(row.remark || ''),
       };
     });
 

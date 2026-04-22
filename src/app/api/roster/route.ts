@@ -17,6 +17,15 @@ interface ParsedRoster {
   students: StudentRecord[];
 }
 
+/** 备注列为空但排除标签来自「半免列」等时，需写入规范备注，否则 is_half_free 记录在详情/导出中会全部显示为半免 */
+function remarkForAttendanceInsert(student: StudentRecord): string | null {
+  const trimmed = student.remark != null ? String(student.remark).trim() : '';
+  if (trimmed) return trimmed;
+  if (student.exclude_label === 'free') return '免费';
+  if (student.exclude_label === 'half_free') return '半免';
+  return null;
+}
+
 function isMissingClassesUserIdError(message: string): boolean {
   return /user_id/i.test(message) && (/classes/i.test(message) || /schema cache/i.test(message));
 }
@@ -152,27 +161,34 @@ export async function POST(request: NextRequest) {
         existingStudent = newStudent;
       }
 
-      // 创建点名记录：优先携带 remark（用于区分免费/半免展示），旧库无该列时自动回退
-      let recordResult = await supabase
-        .from('attendance_records')
-        .insert({
-          class_id: classId,
-          student_id: existingStudent.id,
-          lessons_attended: student.lessons_attended,
-          is_half_free: student.is_half_free,
-          remark: student.remark ?? (student.exclude_label === 'free' ? '免费' : student.exclude_label === 'half_free' ? '半免' : null),
-        });
+      // 创建点名记录：remark + is_full_free 均可区分免费/半免；旧库缺列时按序尝试直至成功
+      const remarkPayload = remarkForAttendanceInsert(student);
+      const fullFreePayload = student.exclude_label === 'free';
 
-      if (recordResult.error && /remark/i.test(recordResult.error.message)) {
+      const baseRow = {
+        class_id: classId,
+        student_id: existingStudent.id,
+        lessons_attended: student.lessons_attended,
+        is_half_free: student.is_half_free,
+      };
+
+      const insertAttempts = [
+        { ...baseRow, remark: remarkPayload, is_full_free: fullFreePayload },
+        { ...baseRow, is_full_free: fullFreePayload },
+        { ...baseRow, remark: remarkPayload },
+        baseRow,
+      ];
+
+      let recordResult = await supabase.from('attendance_records').insert(insertAttempts[0]);
+      let attemptIdx = 0;
+      while (recordResult.error && attemptIdx < insertAttempts.length - 1) {
+        attemptIdx += 1;
+        recordResult = await supabase.from('attendance_records').insert(insertAttempts[attemptIdx]);
+      }
+
+      // 未写入 remark（缺列）或退回到最简插入时，提示迁移
+      if (!recordResult.error && (attemptIdx === 1 || attemptIdx === 3)) {
         usedRemarkFallback = true;
-        recordResult = await supabase
-          .from('attendance_records')
-          .insert({
-            class_id: classId,
-            student_id: existingStudent.id,
-            lessons_attended: student.lessons_attended,
-            is_half_free: student.is_half_free,
-          });
       }
 
       if (recordResult.error) throw new Error(`创建点名记录失败: ${recordResult.error.message}`);
@@ -187,7 +203,7 @@ export async function POST(request: NextRequest) {
         student_count: parsedRoster.students.length,
         is_update: isUpdate,
         warning: usedRemarkFallback
-          ? '当前数据库未启用 attendance_records.remark 字段，免费/半免将无法长期精确区分。建议在 Supabase 执行 scripts/sql/add-attendance-remark.sql。'
+          ? '当前数据库未启用 attendance_records.remark / is_full_free 等字段时，可能影响免费与半免的区分与筛选。请在 Supabase 依次执行 scripts/sql/add-attendance-remark.sql 与 scripts/sql/add-attendance-is-full-free.sql。'
           : undefined,
       },
     });
@@ -239,6 +255,21 @@ export async function GET() {
   }
 }
 
+/** 除姓名、课时外的单元格合并成一段文本，用于识别「免费」写在类型/学费等非「备注」列的情况 */
+function combinedAuxiliaryCells(
+  row: (string | number | boolean | null)[],
+  nameIndex: number,
+  lessonsIndex: number
+): string {
+  const parts: string[] = [];
+  for (let j = 0; j < row.length; j++) {
+    if (j === nameIndex || j === lessonsIndex) continue;
+    const cell = String(row[j] ?? '').trim();
+    if (cell) parts.push(cell);
+  }
+  return parts.join(' ');
+}
+
 function parseRosterData(
   data: (string | number | boolean | null)[][],
   className: string,
@@ -272,7 +303,12 @@ function parseRosterData(
       headerStr.includes('备注') ||
       headerStr.includes('remark') ||
       headerStr.includes('note') ||
-      headerStr.includes('说明')
+      headerStr.includes('说明') ||
+      headerStr.includes('标签') ||
+      headerStr.includes('类型') ||
+      headerStr.includes('学费') ||
+      headerStr.includes('缴费') ||
+      headerStr.includes('性质')
     ) {
       remarkIndex = index;
     } else if (
@@ -290,7 +326,7 @@ function parseRosterData(
   if (lessonsIndex === -1) lessonsIndex = 1;
   // remarkIndex 和 halfFreeIndex 可选，不设默认值
 
-  const freeKeywords = ['免费', '全免', '免学费'];
+  const freeKeywords = ['免费', '全免', '免学费', '减免'];
   const halfFreeKeywords = ['半免', '优惠', '折扣', 'half'];
   const withdrawKeywords = ['退费', '试听', '休学', '退学', '退款', '取消', '退'];
 
@@ -351,8 +387,12 @@ function parseRosterData(
     if (halfFreeIndex >= 0 && halfFreeIndex < row.length) {
       halfFreeValue = row[halfFreeIndex] !== null ? String(row[halfFreeIndex]) : '';
     }
-    
-    const flags = parseExcludeFlags(remarkValue, halfFreeValue);
+
+    const combinedNotes = combinedAuxiliaryCells(row, nameIndex, lessonsIndex);
+    const flags = parseExcludeFlags(combinedNotes, halfFreeValue);
+
+    const remarkDesignated = remarkValue && remarkValue.trim() ? remarkValue.trim() : '';
+    const remarkForStorage = remarkDesignated || combinedNotes.trim().slice(0, 255) || null;
     const isWithdrawLike = flags.isWithdrawLike && !flags.isHalfFree;
     // 退费/退学类学生按业务应排除，且不应显示为“半免”。
     if (isWithdrawLike) {
@@ -363,7 +403,7 @@ function parseRosterData(
       name,
       lessons_attended: lessonsAttended,
       is_half_free: flags.isHalfFree,
-      remark: remarkValue,
+      remark: remarkForStorage,
       exclude_label: flags.label,
     });
   }
