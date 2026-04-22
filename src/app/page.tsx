@@ -16,7 +16,6 @@ import { Label } from '@/components/ui/label';
 import { Upload, BarChart3, FileSpreadsheet, CheckCircle2, XCircle, Loader2, Download, UserX, Users, UserCheck, Eye, Trash2, Edit, Search, X, Pencil, LogOut } from 'lucide-react';
 import { compareGradeLabels, extractGradeFromClassName } from '@/lib/class-grade';
 import { compareSchoolYearLabels, groupClassesBySchoolYearAndGrade } from '@/lib/class-org';
-import * as XLSX from 'xlsx';
 
 /** 上传「学年/届次」输入框的下拉建议（可与已有数据合并） */
 const SCHOOL_TERM_SUGGESTIONS = [
@@ -906,6 +905,7 @@ export default function Home() {
     try {
       const totalLessonsNum = Math.max(1, parseInt(totalLessons, 10) || 12);
       const buffer = await nextFile.arrayBuffer();
+      const XLSX = await import('xlsx');
       const workbook = XLSX.read(new Uint8Array(buffer), { type: 'array' });
       const sheetName = workbook.SheetNames[0];
       if (!sheetName) {
@@ -938,8 +938,7 @@ export default function Home() {
     }
     setFile(nextFile);
     setShowAllUploadPreviewRows(false);
-    void parseUploadPreview(nextFile);
-  }, [parseUploadPreview]);
+  }, []);
 
   useEffect(() => {
     if (!file) return;
