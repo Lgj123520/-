@@ -16,6 +16,7 @@ import { Label } from '@/components/ui/label';
 import { Upload, BarChart3, FileSpreadsheet, CheckCircle2, XCircle, Loader2, Download, UserX, Users, UserCheck, Eye, Trash2, Edit, Search, X, Pencil, LogOut } from 'lucide-react';
 import { compareGradeLabels, extractGradeFromClassName } from '@/lib/class-grade';
 import { compareSchoolYearLabels, groupClassesBySchoolYearAndGrade } from '@/lib/class-org';
+import { detectRosterColumnIndexes, findRosterHeaderRowIndex, inferTotalLessonsFromSheetColumn, parseLessonCountCell } from '@/lib/roster-columns';
 
 /** 上传「学年/届次」输入框的下拉建议（可与已有数据合并） */
 const SCHOOL_TERM_SUGGESTIONS = [
@@ -219,6 +220,8 @@ interface UploadPreviewData {
   half_free_count: number;
   withdraw_count: number;
   low_attendance_count: number;
+  /** 表内「总课时」列推断出的班级总课时，用于同步上传表单 */
+  suggested_total_lessons?: number;
 }
 
 interface AuthUser {
@@ -817,51 +820,30 @@ export default function Home() {
   }, [matchFromTerm, existingTerms, matchToTerm]);
 
   const buildUploadPreview = useCallback((data: (string | number | boolean | null)[][], totalLessonsInput: number): UploadPreviewData => {
-    const headers = data[0] || [];
-    let nameIndex = -1;
-    let lessonsIndex = -1;
-    let remarkIndex = -1;
-    let halfFreeIndex = -1;
+    const headerRow = findRosterHeaderRowIndex(data);
+    const headers = data[headerRow] || [];
+    const {
+      nameIndex,
+      attendedIndex,
+      totalLessonsColumnIndex,
+      remarkIndex,
+      halfFreeIndex,
+    } = detectRosterColumnIndexes(headers);
 
-    headers.forEach((header, index) => {
-      const headerStr = String(header || '').toLowerCase().trim();
-      if (headerStr.includes('姓名') || headerStr.includes('名字') || headerStr === 'name') {
-        nameIndex = index;
-      } else if (
-        headerStr.includes('课时') ||
-        headerStr.includes('上课') ||
-        headerStr.includes('出勤') ||
-        headerStr.includes('lessons')
-      ) {
-        lessonsIndex = index;
-      } else if (
-        headerStr.includes('备注') ||
-        headerStr.includes('remark') ||
-        headerStr.includes('note') ||
-        headerStr.includes('说明') ||
-        headerStr.includes('标签') ||
-        headerStr.includes('类型') ||
-        headerStr.includes('学费') ||
-        headerStr.includes('缴费') ||
-        headerStr.includes('性质')
-      ) {
-        remarkIndex = index;
-      } else if (headerStr.includes('半免') || headerStr.includes('优惠') || headerStr.includes('折扣') || headerStr.includes('half')) {
-        halfFreeIndex = index;
-      }
-    });
-
-    if (nameIndex === -1) nameIndex = 0;
-    if (lessonsIndex === -1) lessonsIndex = 1;
+    const inferredTotal = inferTotalLessonsFromSheetColumn(data, totalLessonsColumnIndex, headerRow + 1);
+    const effectiveTotalLessons =
+      inferredTotal != null && inferredTotal > 0 ? inferredTotal : Math.max(1, totalLessonsInput);
 
     const combinedAuxiliaryCells = (
       row: (string | number | boolean | null)[],
       ni: number,
-      li: number
+      ai: number,
+      ti: number
     ) => {
       const parts: string[] = [];
       for (let j = 0; j < row.length; j++) {
-        if (j === ni || j === li) continue;
+        if (j === ni || j === ai) continue;
+        if (ti >= 0 && j === ti) continue;
         const cell = String(row[j] ?? '').trim();
         if (cell) parts.push(cell);
       }
@@ -872,21 +854,18 @@ export default function Home() {
     const halfFreeKeywords = ['半免', '优惠', '折扣', 'half'];
     const withdrawKeywords = ['退费', '试听', '休学', '退学', '退款', '取消', '退班', '退'];
     const rows: UploadPreviewRow[] = [];
-    const oneThird = Math.ceil(Math.max(1, totalLessonsInput) / 3);
-    for (let i = 1; i < data.length; i++) {
+    const oneThird = Math.ceil(Math.max(1, effectiveTotalLessons) / 3);
+    for (let i = headerRow + 1; i < data.length; i++) {
       const row = data[i];
       if (!row || row.length === 0) continue;
       const name = String(row[nameIndex] || '').trim();
       if (!name) continue;
 
-      let lessonsAttended = 0;
-      const lessonsValue = row[lessonsIndex];
-      if (typeof lessonsValue === 'number') lessonsAttended = lessonsValue;
-      else if (typeof lessonsValue === 'string') lessonsAttended = parseInt(lessonsValue, 10) || 0;
+      let lessonsAttended = parseLessonCountCell(row[attendedIndex]);
 
       const remarkValue = remarkIndex >= 0 && remarkIndex < row.length ? String(row[remarkIndex] || '').trim() : '';
       const halfFreeValue = halfFreeIndex >= 0 && halfFreeIndex < row.length ? String(row[halfFreeIndex] || '').trim() : '';
-      const combinedNotes = combinedAuxiliaryCells(row, nameIndex, lessonsIndex);
+      const combinedNotes = combinedAuxiliaryCells(row, nameIndex, attendedIndex, totalLessonsColumnIndex);
       const text = `${combinedNotes} ${halfFreeValue}`.toLowerCase();
 
       const isWithdraw = withdrawKeywords.some((k) => text.includes(k.toLowerCase()));
@@ -924,6 +903,7 @@ export default function Home() {
       half_free_count: rows.filter((r) => r.exclude_label === 'half_free').length,
       withdraw_count: rows.filter((r) => r.exclude_label === 'withdraw').length,
       low_attendance_count: rows.filter((r) => r.exclude_label === 'low_attendance').length,
+      suggested_total_lessons: inferredTotal ?? undefined,
     };
   }, []);
 
@@ -942,7 +922,11 @@ export default function Home() {
       }
       const worksheet = workbook.Sheets[sheetName];
       const jsonData = XLSX.utils.sheet_to_json(worksheet, { header: 1 }) as (string | number | boolean | null)[][];
-      setUploadPreview(buildUploadPreview(jsonData, totalLessonsNum));
+      const preview = buildUploadPreview(jsonData, totalLessonsNum);
+      setUploadPreview(preview);
+      if (preview.suggested_total_lessons != null && preview.suggested_total_lessons > 0) {
+        setTotalLessons(String(preview.suggested_total_lessons));
+      }
     } catch (error: unknown) {
       setUploadPreview(null);
       setMessage({ type: 'error', text: clientErrorToZhMessage(error, '解析文件失败，请确认文件格式正确') });

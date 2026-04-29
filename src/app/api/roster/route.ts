@@ -1,5 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getSupabaseClient } from '@/storage/database/supabase-client';
+import {
+  detectRosterColumnIndexes,
+  findRosterHeaderRowIndex,
+  inferTotalLessonsFromSheetColumn,
+  parseLessonCountCell,
+} from '@/lib/roster-columns';
 import * as XLSX from 'xlsx';
 
 interface StudentRecord {
@@ -54,7 +60,7 @@ export async function POST(request: NextRequest) {
     const file = formData.get('file') as File;
     const className = formData.get('className') as string;
     const term = formData.get('term') as string;
-    const totalLessons = parseInt(formData.get('totalLessons') as string) || 12;
+    const totalLessonsFromForm = parseInt(formData.get('totalLessons') as string) || 12;
 
     if (!file || !className || !term) {
       return NextResponse.json(
@@ -77,7 +83,8 @@ export async function POST(request: NextRequest) {
     const jsonData = XLSX.utils.sheet_to_json(worksheet, { header: 1 }) as (string | number | boolean | null)[][];
 
     // 解析点名册数据
-    const parsedRoster = parseRosterData(jsonData, className, term, totalLessons);
+    const parsedRoster = parseRosterData(jsonData, className, term, totalLessonsFromForm);
+    const effectiveTotalLessons = parsedRoster.total_lessons;
 
     // 保存到数据库
     const supabase = getSupabaseClient();
@@ -97,7 +104,7 @@ export async function POST(request: NextRequest) {
       // 存在同名班级，更新现有班级的总课时
       const { error: updateError } = await supabase
         .from('classes')
-        .update({ total_lessons: totalLessons })
+        .update({ total_lessons: effectiveTotalLessons })
         .eq('id', existingClass.id);
 
       if (updateError) throw new Error(`更新班级失败: ${updateError.message}`);
@@ -119,7 +126,7 @@ export async function POST(request: NextRequest) {
           user_id: 'shared',
           name: className,
           term: term,
-          total_lessons: totalLessons,
+          total_lessons: effectiveTotalLessons,
         })
         .select('id')
         .single();
@@ -130,7 +137,7 @@ export async function POST(request: NextRequest) {
           .insert({
             name: className,
             term: term,
-            total_lessons: totalLessons,
+            total_lessons: effectiveTotalLessons,
           })
           .select('id')
           .single();
@@ -199,7 +206,7 @@ export async function POST(request: NextRequest) {
       data: {
         class_name: className,
         term: term,
-        total_lessons: totalLessons,
+        total_lessons: effectiveTotalLessons,
         student_count: parsedRoster.students.length,
         is_update: isUpdate,
         warning: usedRemarkFallback
@@ -255,15 +262,17 @@ export async function GET() {
   }
 }
 
-/** 除姓名、课时外的单元格合并成一段文本，用于识别「免费」写在类型/学费等非「备注」列的情况 */
+/** 除姓名、已上课时、表内总课时列外的单元格合并成一段文本，用于识别「免费」写在类型/学费等非「备注」列的情况 */
 function combinedAuxiliaryCells(
   row: (string | number | boolean | null)[],
   nameIndex: number,
-  lessonsIndex: number
+  attendedIndex: number,
+  totalLessonsColumnIndex: number
 ): string {
   const parts: string[] = [];
   for (let j = 0; j < row.length; j++) {
-    if (j === nameIndex || j === lessonsIndex) continue;
+    if (j === nameIndex || j === attendedIndex) continue;
+    if (totalLessonsColumnIndex >= 0 && j === totalLessonsColumnIndex) continue;
     const cell = String(row[j] ?? '').trim();
     if (cell) parts.push(cell);
   }
@@ -274,57 +283,30 @@ function parseRosterData(
   data: (string | number | boolean | null)[][],
   className: string,
   term: string,
-  totalLessons: number
+  totalLessonsFromForm: number
 ): ParsedRoster {
   const students: StudentRecord[] = [];
 
-  // 假设第一行是表头
-  const headers = data[0] || [];
-  
-  // 查找姓名、课时、备注对应的列索引
-  let nameIndex = -1;
-  let lessonsIndex = -1;
-  let remarkIndex = -1;
-  // 兼容旧格式的半免列
-  let halfFreeIndex = -1;
+  // 假设表头在第 1 行或前几行（跳过标题行）
+  const headerRow = findRosterHeaderRowIndex(data);
+  const headers = data[headerRow] || [];
+  const {
+    nameIndex,
+    attendedIndex,
+    totalLessonsColumnIndex,
+    remarkIndex,
+    halfFreeIndex,
+  } = detectRosterColumnIndexes(headers);
 
-  headers.forEach((header, index) => {
-    const headerStr = String(header || '').toLowerCase().trim();
-    if (headerStr.includes('姓名') || headerStr.includes('名字') || headerStr === 'name') {
-      nameIndex = index;
-    } else if (
-      headerStr.includes('课时') ||
-      headerStr.includes('上课') ||
-      headerStr.includes('出勤') ||
-      headerStr.includes('lessons')
-    ) {
-      lessonsIndex = index;
-    } else if (
-      headerStr.includes('备注') ||
-      headerStr.includes('remark') ||
-      headerStr.includes('note') ||
-      headerStr.includes('说明') ||
-      headerStr.includes('标签') ||
-      headerStr.includes('类型') ||
-      headerStr.includes('学费') ||
-      headerStr.includes('缴费') ||
-      headerStr.includes('性质')
-    ) {
-      remarkIndex = index;
-    } else if (
-      headerStr.includes('半免') ||
-      headerStr.includes('优惠') ||
-      headerStr.includes('折扣') ||
-      headerStr.includes('half')
-    ) {
-      halfFreeIndex = index;
-    }
-  });
-
-  // 默认索引（如果没找到）
-  if (nameIndex === -1) nameIndex = 0;
-  if (lessonsIndex === -1) lessonsIndex = 1;
-  // remarkIndex 和 halfFreeIndex 可选，不设默认值
+  const inferredFromSheet = inferTotalLessonsFromSheetColumn(
+    data,
+    totalLessonsColumnIndex,
+    headerRow + 1
+  );
+  const totalLessons =
+    inferredFromSheet != null && inferredFromSheet > 0
+      ? inferredFromSheet
+      : Math.max(1, totalLessonsFromForm);
 
   const freeKeywords = ['免费', '全免', '免学费', '减免'];
   const halfFreeKeywords = ['半免', '优惠', '折扣', 'half'];
@@ -360,22 +342,16 @@ function parseRosterData(
     };
   }
 
-  // 从第二行开始读取数据
-  for (let i = 1; i < data.length; i++) {
+  // 从表头下一行开始读取数据
+  for (let i = headerRow + 1; i < data.length; i++) {
     const row = data[i];
     if (!row || row.length === 0) continue;
 
     const name = String(row[nameIndex] || '').trim();
     if (!name) continue;
 
-    // 解析课时数
-    let lessonsAttended = 0;
-    const lessonsValue = row[lessonsIndex];
-    if (typeof lessonsValue === 'number') {
-      lessonsAttended = lessonsValue;
-    } else if (typeof lessonsValue === 'string') {
-      lessonsAttended = parseInt(lessonsValue) || 0;
-    }
+    // 解析已上课时
+    let lessonsAttended = parseLessonCountCell(row[attendedIndex]);
 
     // 解析备注列，区分「半免类」和「退费/退学类」
     let remarkValue: string | null = null;
@@ -388,7 +364,12 @@ function parseRosterData(
       halfFreeValue = row[halfFreeIndex] !== null ? String(row[halfFreeIndex]) : '';
     }
 
-    const combinedNotes = combinedAuxiliaryCells(row, nameIndex, lessonsIndex);
+    const combinedNotes = combinedAuxiliaryCells(
+      row,
+      nameIndex,
+      attendedIndex,
+      totalLessonsColumnIndex
+    );
     const flags = parseExcludeFlags(combinedNotes, halfFreeValue);
 
     const remarkDesignated = remarkValue && remarkValue.trim() ? remarkValue.trim() : '';
