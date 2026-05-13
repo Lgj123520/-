@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getSupabaseClient } from '@/storage/database/supabase-client';
 import { compareGradeLabels, extractGradeFromClassName } from '@/lib/class-grade';
+import { effectiveRowTotalLessons } from '@/lib/roster-columns';
 
 function pickNameField(v: { name?: string } | { name?: string }[] | null | undefined): string {
   if (!v) return '未知';
@@ -101,10 +102,14 @@ export async function POST(request: NextRequest) {
     const sourceStudentDetails: Record<string, { name: string; lessons_attended: number; total_lessons: number }> = {};
 
     for (const record of sourceRecords || []) {
-      const totalLessons = record.classes?.total_lessons || 12;
-      const oneThird = Math.ceil(totalLessons / 3);
-      // 修正异常数据：上课课时不能超过总课时
-      const lessonsAttended = Math.min(record.lessons_attended, totalLessons);
+      const classTotal = record.classes?.total_lessons || 12;
+      const eff = effectiveRowTotalLessons(
+        (record as { sheet_total_lessons?: number | null }).sheet_total_lessons,
+        classTotal
+      );
+      const oneThird = Math.ceil(eff / 3);
+      // 修正异常数据：上课课时不能超过该生总课时
+      const lessonsAttended = Math.min(record.lessons_attended, eff);
 
       // 排除半免或上课不足1/3的学生
       if (record.is_half_free) continue;
@@ -114,7 +119,7 @@ export async function POST(request: NextRequest) {
       sourceStudentDetails[record.student_id] = {
         name: record.students?.name || '未知',
         lessons_attended: lessonsAttended,
-        total_lessons: totalLessons,
+        total_lessons: eff,
       };
     }
 
@@ -130,7 +135,7 @@ export async function POST(request: NextRequest) {
     if (targetClasses.length > 0) {
       const { data: targetRecords, error: targetRecordsError } = await supabase
         .from('attendance_records')
-        .select('student_id, class_id, lessons_attended, students(name), classes(total_lessons)')
+        .select('student_id, class_id, lessons_attended, sheet_total_lessons, students(name), classes(total_lessons)')
         .in('class_id', targetClassIds);
 
       if (targetRecordsError) throw new Error(`获取目标班级记录失败: ${targetRecordsError.message}`);
@@ -146,14 +151,18 @@ export async function POST(request: NextRequest) {
         }
         set.add(cname);
         if (!targetStudentDetails.has(record.student_id)) {
-          const totalLessons = pickTotalLessonsField(
+          const classTotal = pickTotalLessonsField(
             record.classes as { total_lessons?: number } | { total_lessons?: number }[] | null,
             12
           );
+          const eff = effectiveRowTotalLessons(
+            (record as { sheet_total_lessons?: number | null }).sheet_total_lessons,
+            classTotal
+          );
           targetStudentDetails.set(record.student_id, {
             name: pickNameField(record.students as { name?: string } | { name?: string }[] | null),
-            lessons_attended: Math.min(record.lessons_attended, totalLessons),
-            total_lessons: totalLessons,
+            lessons_attended: Math.min(record.lessons_attended, eff),
+            total_lessons: eff,
           });
         }
       }
@@ -198,9 +207,13 @@ export async function POST(request: NextRequest) {
     const studentClassMap: Record<string, string> = {};
     for (const record of sourceRecords || []) {
       if (!record.is_half_free) {
-        const totalLessons = record.classes?.total_lessons || 12;
-        const oneThird = Math.ceil(totalLessons / 3);
-        if (record.lessons_attended >= oneThird) {
+        const classTotal = record.classes?.total_lessons || 12;
+        const eff = effectiveRowTotalLessons(
+          (record as { sheet_total_lessons?: number | null }).sheet_total_lessons,
+          classTotal
+        );
+        const oneThird = Math.ceil(eff / 3);
+        if (Math.min(record.lessons_attended, eff) >= oneThird) {
           studentClassMap[record.student_id] =
             record.classes?.name ||
             sourceClassNameById.get(record.class_id as string) ||
@@ -251,10 +264,16 @@ export async function POST(request: NextRequest) {
       const totalStudents = classRecords.length;
       
       // 计算有效学生（上课课时不超过总课时）
-      const oneThird = Math.ceil((cls.total_lessons || 12) / 3);
-      const validStudents = classRecords.filter(
-        (r) => !r.is_half_free && Math.min(r.lessons_attended, cls.total_lessons || 12) >= oneThird
-      );
+      const clsTotal = cls.total_lessons || 12;
+      const validStudents = classRecords.filter((r) => {
+        if (r.is_half_free) return false;
+        const eff = effectiveRowTotalLessons(
+          (r as { sheet_total_lessons?: number | null }).sheet_total_lessons,
+          clsTotal
+        );
+        const oneThird = Math.ceil(eff / 3);
+        return Math.min(r.lessons_attended, eff) >= oneThird;
+      });
       const validCount = validStudents.length;
 
       // 计算续读（使用修正后的上课课时）

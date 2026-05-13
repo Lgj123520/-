@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getSupabaseClient } from '@/storage/database/supabase-client';
+import { effectiveRowTotalLessons } from '@/lib/roster-columns';
 
 function joinStudentName(students: { name?: string } | { name?: string }[] | null | undefined): string {
   if (!students) return '未知';
@@ -101,10 +102,14 @@ export async function POST(request: NextRequest) {
     // 构建源学生和目标学生集合
     const validSourceStudents = new Map<string, { id: string; name: string; className: string }>();
     for (const record of sourceRecords || []) {
-      const totalLessons = record.classes?.total_lessons || 12;
-      const oneThird = Math.ceil(totalLessons / 3);
+      const classTotal = record.classes?.total_lessons || 12;
+      const eff = effectiveRowTotalLessons(
+        (record as { sheet_total_lessons?: number | null }).sheet_total_lessons,
+        classTotal
+      );
+      const oneThird = Math.ceil(eff / 3);
       if (record.is_half_free) continue;
-      if (record.lessons_attended < oneThird) continue;
+      if (Math.min(record.lessons_attended, eff) < oneThird) continue;
       
       validSourceStudents.set(record.student_id, {
         id: record.student_id,

@@ -181,6 +181,8 @@ interface ClassDetail {
   student_id: string;
   name: string;
   lessons_attended: number;
+  /** 该生展示用总课时（表内按行或班级默认）；无则前端用 class.total_lessons */
+  display_total_lessons?: number;
   is_half_free: boolean;
   /** 后端写入：无备注列时仍可依此区分免费（与列表筛选「仅免费」一致） */
   is_full_free?: boolean;
@@ -1277,15 +1279,19 @@ export default function Home() {
   // 导出学生列表为 CSV
   const exportStudentsToCsv = (students: ClassDetail[], classInfo: { name: string; total_lessons: number; term: string }) => {
     const headers = ['序号', '姓名', '已上课时', '总课时', '出勤率', '排除类型', '原始备注'];
-    const rows = students.map((student, index) => [
-      index + 1,
-      student.name,
-      student.lessons_attended,
-      classInfo.total_lessons,
-      `${((student.lessons_attended / classInfo.total_lessons) * 100).toFixed(1)}%`,
-      student.is_excluded ? (student.remark || '已排除') : '正常',
-      student.original_remark?.trim() || '',
-    ]);
+    const rows = students.map((student, index) => {
+      const den = student.display_total_lessons ?? classInfo.total_lessons;
+      const safeDen = Math.max(1, den);
+      return [
+        index + 1,
+        student.name,
+        student.lessons_attended,
+        den,
+        `${((Math.min(student.lessons_attended, safeDen) / safeDen) * 100).toFixed(1)}%`,
+        student.is_excluded ? (student.remark || '已排除') : '正常',
+        student.original_remark?.trim() || '',
+      ];
+    });
 
     const csvContent = [
       headers.join(','),
@@ -1329,14 +1335,18 @@ export default function Home() {
     if (!selectedClass || excludedStudents.length === 0) return;
 
     const headers = ['序号', '姓名', '已上课时', '总课时', '出勤率', '备注'];
-    const rows = excludedStudents.map((student, index) => [
-      index + 1,
-      student.name,
-      student.lessons_attended,
-      selectedClass.class.total_lessons,
-      `${((Math.min(student.lessons_attended, selectedClass.class.total_lessons) / selectedClass.class.total_lessons) * 100).toFixed(1)}%`,
-      student.remark || '已排除',
-    ]);
+    const rows = excludedStudents.map((student, index) => {
+      const den = student.display_total_lessons ?? selectedClass.class.total_lessons;
+      const safeDen = Math.max(1, den);
+      return [
+        index + 1,
+        student.name,
+        student.lessons_attended,
+        den,
+        `${((Math.min(student.lessons_attended, safeDen) / safeDen) * 100).toFixed(1)}%`,
+        student.remark || '已排除',
+      ];
+    });
 
     const csvContent = [
       headers.join(','),
@@ -3405,7 +3415,11 @@ export default function Home() {
                     <CardDescription>
                       {selectedClass && (
                         <>
-                          学年 / 届次：{selectedClass.class.term} | 总课时：{selectedClass.class.total_lessons} | 学生数：{selectedClass.students.length}
+                          学年 / 届次：{selectedClass.class.term} | 班级汇总总课时：{selectedClass.class.total_lessons} | 学生数：
+                          {selectedClass.students.length}
+                          <span className="block text-xs text-muted-foreground mt-1">
+                            下表「总课时」为上传表格中<strong>每一行</strong>的值（每人可不同）；与上一项班级汇总可能不一致属正常。
+                          </span>
                         </>
                       )}
                     </CardDescription>
@@ -3539,7 +3553,15 @@ export default function Home() {
                           </TableRow>
                         </TableHeader>
                         <TableBody>
-                          {filteredStudents.map((student) => (
+                          {filteredStudents.map((student) => {
+                            const rowDen =
+                              student.display_total_lessons ?? selectedClass.class.total_lessons;
+                            const safeDen = Math.max(1, rowDen);
+                            const attendedForRate =
+                              editingStudentId === student.id && editedStudent
+                                ? editedStudent.lessons_attended
+                                : lessonsForRowDisplay(student);
+                            return (
                             <TableRow
                               key={student.id}
                               className={student.is_excluded ? 'bg-red-50/50 dark:bg-red-900/10' : ''}
@@ -3581,18 +3603,10 @@ export default function Home() {
                                   />
                                 )}
                               </TableCell>
-                              <TableCell className="text-center">
-                                {selectedClass.class.total_lessons}
-                              </TableCell>
+                              <TableCell className="text-center">{rowDen}</TableCell>
                               <TableCell className="text-center">
                                 {(
-                                  (Math.min(
-                                    editingStudentId === student.id && editedStudent
-                                      ? editedStudent.lessons_attended
-                                      : lessonsForRowDisplay(student),
-                                    selectedClass.class.total_lessons
-                                  ) /
-                                    selectedClass.class.total_lessons) *
+                                  (Math.min(attendedForRate, safeDen) / safeDen) *
                                   100
                                 ).toFixed(0)}
                                 %
@@ -3644,7 +3658,8 @@ export default function Home() {
                                 )}
                               </TableCell>
                             </TableRow>
-                          ))}
+                            );
+                          })}
                           {filteredStudents.length === 0 && (
                             <TableRow>
                               <TableCell colSpan={8} className="text-center py-8 text-slate-500">

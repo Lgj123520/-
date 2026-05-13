@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getSupabaseClient } from '@/storage/database/supabase-client';
+import { effectiveRowTotalLessons } from '@/lib/roster-columns';
 
 // 获取班级详情和所有学生
 export async function GET(
@@ -31,14 +32,15 @@ export async function GET(
 
     if (recordsError) throw new Error(`获取学生列表失败: ${recordsError.message}`);
 
-    // 格式化数据
-    const oneThird = Math.ceil(classInfo.total_lessons / 3);
+    // 格式化数据（每人可有 sheet_total_lessons，否则用班级总课时）
     const students = (records || []).map((record) => {
-      const lessonsAttended = Math.min(record.lessons_attended, classInfo.total_lessons);
+      const row = record as { remark?: string | null; is_full_free?: boolean; sheet_total_lessons?: number | null };
+      const displayTotal = effectiveRowTotalLessons(row.sheet_total_lessons, classInfo.total_lessons);
+      const oneThird = Math.ceil(displayTotal / 3);
+      const lessonsAttended = Math.min(record.lessons_attended, displayTotal);
       const isExcludedByAttendance = lessonsAttended < oneThird;
       const isExcluded = record.is_half_free || isExcludedByAttendance;
       let remark = '';
-      const row = record as { remark?: string | null; is_full_free?: boolean };
       const isFullFreeDb = !!(row.is_full_free ?? false);
       if (record.is_half_free) {
         const rawRemark = String(row.remark || '').trim();
@@ -59,6 +61,7 @@ export async function GET(
         student_id: record.student_id,
         name: record.students?.name || '未知',
         lessons_attended: record.lessons_attended,
+        display_total_lessons: displayTotal,
         is_half_free: !!record.is_half_free,
         is_full_free: isFullFreeDb,
         is_excluded: isExcluded,

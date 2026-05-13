@@ -197,3 +197,12 @@ export function inferTotalLessonsFromSheetColumn(
   }
   return found ? maxVal : null;
 }
+
+/** 展示与「不足 1/3」规则使用的总课时：有按行 sheet 值则用该行，否则用班级总课时 */
+export function effectiveRowTotalLessons(
+  sheetTotalLessons: number | null | undefined,
+  classTotalLessons: number
+): number {
+  if (sheetTotalLessons != null && sheetTotalLessons > 0) return sheetTotalLessons;
+  return Math.max(1, classTotalLessons);
+}

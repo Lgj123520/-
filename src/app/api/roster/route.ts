@@ -11,6 +11,8 @@ import * as XLSX from 'xlsx';
 interface StudentRecord {
   name: string;
   lessons_attended: number;
+  /** 表格该行「总课时」列解析值；无列或未填则为 null */
+  sheet_total_lessons: number | null;
   is_half_free: boolean;
   remark?: string | null;
   exclude_label?: 'free' | 'half_free' | 'withdraw' | null;
@@ -149,6 +151,7 @@ export async function POST(request: NextRequest) {
 
     // 2. 处理学生数据
     let usedRemarkFallback = false;
+    let sheetColumnMissingDb = false;
     for (const student of parsedRoster.students) {
       // 查找或创建学生
       let { data: existingStudent } = await supabase
@@ -179,10 +182,15 @@ export async function POST(request: NextRequest) {
         is_half_free: student.is_half_free,
       };
 
+      const sheetVal = student.sheet_total_lessons ?? null;
       const insertAttempts = [
+        { ...baseRow, remark: remarkPayload, is_full_free: fullFreePayload, sheet_total_lessons: sheetVal },
         { ...baseRow, remark: remarkPayload, is_full_free: fullFreePayload },
-        { ...baseRow, is_full_free: fullFreePayload },
+        { ...baseRow, remark: remarkPayload, sheet_total_lessons: sheetVal },
         { ...baseRow, remark: remarkPayload },
+        { ...baseRow, is_full_free: fullFreePayload, sheet_total_lessons: sheetVal },
+        { ...baseRow, is_full_free: fullFreePayload },
+        { ...baseRow, sheet_total_lessons: sheetVal },
         baseRow,
       ];
 
@@ -194,8 +202,14 @@ export async function POST(request: NextRequest) {
       }
 
       // 未写入 remark（缺列）或退回到最简插入时，提示迁移
-      if (!recordResult.error && (attemptIdx === 1 || attemptIdx === 3)) {
-        usedRemarkFallback = true;
+      if (!recordResult.error) {
+        const ok = insertAttempts[attemptIdx];
+        if (remarkPayload != null && !('remark' in ok)) {
+          usedRemarkFallback = true;
+        }
+        if (sheetVal != null && !('sheet_total_lessons' in ok)) {
+          sheetColumnMissingDb = true;
+        }
       }
 
       if (recordResult.error) throw new Error(`创建点名记录失败: ${recordResult.error.message}`);
@@ -209,9 +223,20 @@ export async function POST(request: NextRequest) {
         total_lessons: effectiveTotalLessons,
         student_count: parsedRoster.students.length,
         is_update: isUpdate,
-        warning: usedRemarkFallback
-          ? '当前数据库未启用 attendance_records.remark / is_full_free 等字段时，可能影响免费与半免的区分与筛选。请在 Supabase 依次执行 scripts/sql/add-attendance-remark.sql 与 scripts/sql/add-attendance-is-full-free.sql。'
-          : undefined,
+        warning: (() => {
+          const parts: string[] = [];
+          if (usedRemarkFallback) {
+            parts.push(
+              '当前数据库未启用 attendance_records.remark / is_full_free 等字段时，可能影响免费与半免的区分与筛选。请在 Supabase 依次执行 scripts/sql/add-attendance-remark.sql 与 scripts/sql/add-attendance-is-full-free.sql。'
+            );
+          }
+          if (sheetColumnMissingDb) {
+            parts.push(
+              '未能写入「表格总课时」按行数据：请在 Supabase 执行 scripts/sql/add-attendance-sheet-total-lessons.sql 后重新上传。'
+            );
+          }
+          return parts.length ? parts.join(' ') : undefined;
+        })(),
       },
     });
   } catch (error: unknown) {
@@ -298,16 +323,6 @@ function parseRosterData(
     halfFreeIndex,
   } = detectRosterColumnIndexes(headers);
 
-  const inferredFromSheet = inferTotalLessonsFromSheetColumn(
-    data,
-    totalLessonsColumnIndex,
-    headerRow + 1
-  );
-  const totalLessons =
-    inferredFromSheet != null && inferredFromSheet > 0
-      ? inferredFromSheet
-      : Math.max(1, totalLessonsFromForm);
-
   const freeKeywords = ['免费', '全免', '免学费', '减免'];
   const halfFreeKeywords = ['半免', '优惠', '折扣', 'half'];
   const withdrawKeywords = ['退费', '试听', '休学', '退学', '退款', '取消', '退'];
@@ -380,14 +395,33 @@ function parseRosterData(
       lessonsAttended = 0;
     }
 
+    let sheetTotalLessons: number | null = null;
+    if (totalLessonsColumnIndex >= 0 && totalLessonsColumnIndex < row.length) {
+      const n = parseLessonCountCell(row[totalLessonsColumnIndex]);
+      if (n > 0) sheetTotalLessons = n;
+    }
+
     students.push({
       name,
       lessons_attended: lessonsAttended,
+      sheet_total_lessons: sheetTotalLessons,
       is_half_free: flags.isHalfFree,
       remark: remarkForStorage,
       exclude_label: flags.label,
     });
   }
+
+  const inferredFromCol =
+    inferTotalLessonsFromSheetColumn(data, totalLessonsColumnIndex, headerRow + 1) ?? 0;
+  const maxRowSheet = Math.max(0, ...students.map((s) => s.sheet_total_lessons ?? 0));
+  const maxAttended = Math.max(0, ...students.map((s) => s.lessons_attended));
+  const formBase = Math.max(1, totalLessonsFromForm);
+  const hasPerRowSheet = students.some((s) => (s.sheet_total_lessons ?? 0) > 0);
+
+  const totalLessons =
+    hasPerRowSheet || inferredFromCol > 0
+      ? Math.max(1, inferredFromCol, maxRowSheet, maxAttended)
+      : Math.max(formBase, maxAttended);
 
   return {
     class_name: className,
