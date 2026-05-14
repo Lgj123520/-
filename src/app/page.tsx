@@ -14,6 +14,7 @@ import { Checkbox } from '@/components/ui/checkbox';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Label } from '@/components/ui/label';
 import { Upload, BarChart3, FileSpreadsheet, CheckCircle2, XCircle, Loader2, Download, UserX, Users, UserCheck, Eye, Trash2, Edit, Search, X, Pencil, LogOut } from 'lucide-react';
+import { buildNewStudentListCsv } from '@/lib/new-student-export';
 import { compareGradeLabels, extractGradeFromClassName } from '@/lib/class-grade';
 import { compareSchoolYearLabels, groupClassesBySchoolYearAndGrade } from '@/lib/class-org';
 import { detectRosterColumnIndexes, findRosterHeaderRowIndex, inferTotalLessonsFromSheetColumn, parseLessonCountCell } from '@/lib/roster-columns';
@@ -69,7 +70,12 @@ function isValidTermFormat(term: string): boolean {
 }
 
 type SeasonTag = 'spring' | 'autumn' | 'winter' | 'summer' | 'unknown';
-type StatPlan = 'autumn_to_spring' | 'winter_to_spring' | 'autumn_winter_to_spring' | 'summer_to_autumn';
+type StatPlan =
+  | 'autumn_to_spring'
+  | 'winter_to_spring'
+  | 'autumn_winter_to_spring'
+  | 'summer_to_autumn'
+  | 'spring_summer_to_autumn';
 
 function detectSeasonTag(term: string): SeasonTag {
   if (term.includes('春')) return 'spring';
@@ -142,6 +148,10 @@ interface StudentDetail {
   target_term?: string;
   /** 续读学生所在目标学年班级名称，多班用顿号连接 */
   renewed_to_class?: string;
+  /** 源学期为退费/退班备注，新学期点名中仍有该生 */
+  returnee_after_withdraw?: boolean;
+  /** 新生：目标学期点名备注状态（半免 / 退费 / 正常） */
+  enrollment_status?: '半免' | '退费' | '正常';
 }
 
 interface RenewalResult {
@@ -152,6 +162,8 @@ interface RenewalResult {
   valid_students: number;
   renewed_students: number;
   not_renewed_students: number;
+  /** 源学期退费/退班但新学期仍点名的续读人数 */
+  returnee_renewed_count?: number;
   new_students?: number;
   renewal_rate: string;
   renewed_details: StudentDetail[];
@@ -746,38 +758,102 @@ export default function Home() {
   const resolvePlanTerms = useCallback(
     (plan: StatPlan) => {
       if (!statYear) {
-        return { fromTerms: [] as string[], toTerms: [] as string[], sourceClassIds: [] as string[], targetClassIds: [] as string[] };
+        return {
+          fromTerms: [] as string[],
+          toTerms: [] as string[],
+          sourceClassIds: [] as string[],
+          targetClassIds: [] as string[],
+          sourceIntersectionGroups: null as string[][] | null,
+          dualSourceCohortLabel: '',
+        };
       }
       const nextYear = nextYearToken(statYear);
       const matchSourceSeason = (season: SeasonTag) => {
         if (plan === 'autumn_to_spring') return season === 'autumn';
         if (plan === 'winter_to_spring') return season === 'winter';
         if (plan === 'summer_to_autumn') return season === 'summer';
+        if (plan === 'spring_summer_to_autumn') return season === 'spring' || season === 'summer';
         return season === 'autumn' || season === 'winter';
       };
       const sourceClasses = classes.filter((c) => {
         const y = extractYearTokenFromText(`${c.term} ${c.name}`);
         const s = detectSeasonTag(`${c.term} ${c.name}`);
         if (!matchSourceSeason(s)) return false;
-        // 兼容旧数据：若未写年份，也允许纳入当前统计口径。
-        return y === statYear || y === null;
+        if (y === null) return true;
+
+        if (plan === 'spring_summer_to_autumn') {
+          return (s === 'spring' || s === 'summer') && y === statYear;
+        }
+        if (plan === 'autumn_to_spring') {
+          return s === 'autumn' && y === statYear;
+        }
+        if (plan === 'winter_to_spring') {
+          return s === 'winter' && (y === statYear || y === nextYear);
+        }
+        if (plan === 'summer_to_autumn') {
+          return s === 'summer' && y === statYear;
+        }
+        // 秋寒升春：同一学年报径 — 秋 = 统计年，寒 = 次年（如 25秋 + 26寒）
+        if (s === 'autumn') return y === statYear;
+        if (s === 'winter') return y === nextYear;
+        return false;
       });
       const targetClasses = classes.filter((c) => {
         const y = extractYearTokenFromText(`${c.term} ${c.name}`);
         const s = detectSeasonTag(`${c.term} ${c.name}`);
-        const isTargetSeason = plan === 'summer_to_autumn' ? s === 'autumn' : s === 'spring';
-        if (!isTargetSeason) return false;
-        return plan === 'summer_to_autumn'
-          ? y === statYear || y === null
-          : y === statYear || y === nextYear || y === null;
+        if (y === null) return true;
+
+        if (plan === 'summer_to_autumn' || plan === 'spring_summer_to_autumn') {
+          return s === 'autumn' && y === statYear;
+        }
+        if (plan === 'autumn_winter_to_spring') {
+          return s === 'spring' && y === nextYear;
+        }
+        if (plan === 'autumn_to_spring') {
+          return s === 'spring' && y === nextYear;
+        }
+        // 寒升春：春与寒常见同年或相邻年标注
+        if (plan === 'winter_to_spring') {
+          return s === 'spring' && (y === statYear || y === nextYear);
+        }
+        return false;
       });
       const fromTerms = [...new Set(sourceClasses.map((c) => c.term))];
       const toTerms = [...new Set(targetClasses.map((c) => c.term))];
+
+      let sourceIntersectionGroups: string[][] | null = null;
+      let dualSourceCohortLabel = '';
+      if (plan === 'autumn_winter_to_spring') {
+        const autumnIds = sourceClasses
+          .filter((c) => detectSeasonTag(`${c.term} ${c.name}`) === 'autumn')
+          .map((c) => c.id);
+        const winterIds = sourceClasses
+          .filter((c) => detectSeasonTag(`${c.term} ${c.name}`) === 'winter')
+          .map((c) => c.id);
+        if (autumnIds.length > 0 && winterIds.length > 0) {
+          sourceIntersectionGroups = [autumnIds, winterIds];
+          dualSourceCohortLabel = `${statYear}秋+${nextYear}寒`;
+        }
+      } else if (plan === 'spring_summer_to_autumn') {
+        const springIds = sourceClasses
+          .filter((c) => detectSeasonTag(`${c.term} ${c.name}`) === 'spring')
+          .map((c) => c.id);
+        const summerIds = sourceClasses
+          .filter((c) => detectSeasonTag(`${c.term} ${c.name}`) === 'summer')
+          .map((c) => c.id);
+        if (springIds.length > 0 && summerIds.length > 0) {
+          sourceIntersectionGroups = [springIds, summerIds];
+          dualSourceCohortLabel = `${statYear}春+${statYear}暑`;
+        }
+      }
+
       return {
         fromTerms,
         toTerms,
         sourceClassIds: sourceClasses.map((c) => c.id),
         targetClassIds: targetClasses.map((c) => c.id),
+        sourceIntersectionGroups,
+        dualSourceCohortLabel,
       };
     },
     [classes, statYear]
@@ -786,9 +862,11 @@ export default function Home() {
   const planTerms = useMemo(() => resolvePlanTerms(statPlan), [resolvePlanTerms, statPlan]);
 
   const effectivePlanTerms = useMemo(() => {
-    const hasSource = planTerms.sourceClassIds.length > 0;
     const hasTarget = planTerms.targetClassIds.length > 0;
-    if (statPlan !== 'autumn_winter_to_spring' || hasSource || !hasTarget) {
+    const dualAutumnWinterOk =
+      statPlan === 'autumn_winter_to_spring' && Boolean(planTerms.sourceIntersectionGroups);
+    // 秋寒升春但缺秋季源班时，仍可按「寒升春」自动降级（与历史行为一致）
+    if (statPlan !== 'autumn_winter_to_spring' || dualAutumnWinterOk || !hasTarget) {
       return { ...planTerms, effectivePlan: statPlan, autoDowngraded: false };
     }
     const winterOnly = resolvePlanTerms('winter_to_spring');
@@ -878,7 +956,6 @@ export default function Home() {
       if (isWithdraw) {
         excludeLabel = 'withdraw';
         displayRemark = '退费/退班';
-        lessonsAttended = 0;
       } else if (isFree) {
         excludeLabel = 'free';
         displayRemark = '免费';
@@ -1030,21 +1107,51 @@ export default function Home() {
         setMessage({ type: 'error', text: '当前年份缺少可统计的学期（请确认已上传对应秋/寒/暑/春班级）' });
         return;
       }
+      if (
+        (effectivePlanTerms.effectivePlan === 'autumn_winter_to_spring' ||
+          effectivePlanTerms.effectivePlan === 'spring_summer_to_autumn') &&
+        !effectivePlanTerms.sourceIntersectionGroups
+      ) {
+        setMessage({
+          type: 'error',
+          text:
+            effectivePlanTerms.effectivePlan === 'autumn_winter_to_spring'
+              ? '秋寒升春需同时存在秋季与寒假源班（且年份与统计年一致），请检查班级名称/学期中的「秋」「寒」与年份标注。'
+              : '春暑升秋需同时存在春季与暑假源班，请检查班级名称/学期中的「春」「暑」与年份标注。',
+        });
+        return;
+      }
       const planLabel =
         effectivePlanTerms.effectivePlan === 'autumn_to_spring'
           ? '秋升春'
           : effectivePlanTerms.effectivePlan === 'winter_to_spring'
-          ? '寒升春'
-          : effectivePlanTerms.effectivePlan === 'summer_to_autumn'
-          ? '暑升秋'
-          : '秋寒升春';
+            ? '寒升春'
+            : effectivePlanTerms.effectivePlan === 'summer_to_autumn'
+              ? '暑升秋'
+              : effectivePlanTerms.effectivePlan === 'spring_summer_to_autumn'
+                ? '春暑升秋'
+                : '秋寒升春';
+      const ny = nextYearToken(statYear);
+      const toTermLabel =
+        effectivePlanTerms.effectivePlan === 'summer_to_autumn' ||
+        effectivePlanTerms.effectivePlan === 'spring_summer_to_autumn'
+          ? `${statYear}年秋季`
+          : effectivePlanTerms.effectivePlan === 'winter_to_spring'
+            ? `${statYear}年春季`
+            : `${ny}年春季`;
       payload = {
         fromTerms: effectivePlanTerms.fromTerms,
         toTerms: effectivePlanTerms.toTerms,
         sourceClassIds: effectivePlanTerms.sourceClassIds,
         targetClassIds: effectivePlanTerms.targetClassIds,
         fromTermLabel: `${statYear}年${planLabel}`,
-        toTermLabel: `${statYear}年${effectivePlanTerms.effectivePlan === 'summer_to_autumn' ? '秋季' : '春季'}`,
+        toTermLabel,
+        ...(effectivePlanTerms.sourceIntersectionGroups
+          ? {
+              sourceIntersectionGroups: effectivePlanTerms.sourceIntersectionGroups,
+              dualSourceCohortLabel: effectivePlanTerms.dualSourceCohortLabel,
+            }
+          : {}),
       };
     } else {
       if (!fromTerm || !toTerm) {
@@ -1616,15 +1723,16 @@ export default function Home() {
   const exportRenewedList = () => {
     if (!result || !filteredRenewedDetails.length) return;
 
-    const headers = ['序号', '姓名', '源班级', '续读班级', '已上课时', '总课时', '出勤率'];
+    const headers = ['序号', '姓名', '源班级', '续读班级', '续读类型', '已上课时', '总课时', '出勤率'];
     const rows = filteredRenewedDetails.map((student, index) => [
       index + 1,
       student.name,
       student.class_name || '未知班级',
       student.renewed_to_class || '—',
+      student.returnee_after_withdraw ? '退费后退学再读' : '正常续读',
       student.lessons_attended,
       student.total_lessons,
-      `${((student.lessons_attended / student.total_lessons) * 100).toFixed(1)}%`,
+      `${((student.lessons_attended / Math.max(1, student.total_lessons)) * 100).toFixed(1)}%`,
     ]);
 
     const csvContent = [
@@ -1668,30 +1776,10 @@ export default function Home() {
     URL.revokeObjectURL(url);
   };
 
-  // 导出新生名单，可按目标班级筛选
+  // 导出新生名单，可按目标班级筛选（列定义见 @/lib/new-student-export）
   const exportNewStudentList = () => {
     if (!result || !filteredNewStudentDetails.length) return;
 
-    const headers = ['序号', '姓名', '目标班级', '已上课时', '总课时', '出勤率'];
-    const rows = filteredNewStudentDetails.map((student, index) => [
-      index + 1,
-      student.name,
-      student.class_name || '未知班级',
-      student.lessons_attended,
-      student.total_lessons,
-      `${((student.lessons_attended / student.total_lessons) * 100).toFixed(1)}%`,
-    ]);
-
-    const csvContent = [
-      headers.join(','),
-      ...rows.map((row) => row.map((cell) => `"${cell}"`).join(',')),
-    ].join('\n');
-
-    const BOM = '\uFEFF';
-    const blob = new Blob([BOM + csvContent], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
     const tgtPart =
       newStudentExportTargetClass !== EXPORT_CLASS_FILTER_ALL
         ? `_目标班_${sanitizeCsvFilenamePart(newStudentExportTargetClass)}`
@@ -1704,11 +1792,19 @@ export default function Home() {
       newStudentExportTargetGrade !== EXPORT_CLASS_FILTER_ALL
         ? `_目标年级_${sanitizeCsvFilenamePart(newStudentExportTargetGrade)}`
         : '';
-    link.download = `${result.to_term}_新生名单${tgtPart}${tgtYearPart}${tgtGradePart}_${formatZhDate(Date.now()).replace(/\//g, '-')}.csv`;
+    const baseName = `${result.to_term}_新生名单_含名单状态${tgtPart}${tgtYearPart}${tgtGradePart}_${formatZhDate(Date.now()).replace(/\//g, '-')}.csv`;
+
+    const csvText = buildNewStudentListCsv(filteredNewStudentDetails);
+    const blob = new Blob([csvText], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = baseName;
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
     URL.revokeObjectURL(url);
+    setMessage({ type: 'success', text: `已导出新生名单 ${filteredNewStudentDetails.length} 人（含名单状态列）。` });
   };
 
   if (authChecking) {
@@ -2130,6 +2226,12 @@ export default function Home() {
                         <p className="font-medium text-sky-600">{result.new_students ?? result.new_student_details?.length ?? 0}</p>
                       </div>
                     </div>
+                    {(result.returnee_renewed_count ?? 0) > 0 && (
+                      <p className="text-xs text-center text-slate-600 dark:text-slate-400 mt-3 max-w-xl mx-auto leading-relaxed">
+                        其中 <strong>{result.returnee_renewed_count}</strong> 人为源学期备注退费/退班、新学期点名中仍出现（已计入续读）。续班率 = 续读人数 ÷
+                        有效人数，含此类回流时整体续班率可能超过 100%。
+                      </p>
+                    )}
                   </div>
 
                   {gradeSummary.length > 0 && (
@@ -2255,7 +2357,7 @@ export default function Home() {
                 {statsYearOptions.length > 0 ? (
                   <div className="space-y-3 rounded-lg border p-4 bg-slate-50/70 dark:bg-slate-900/30">
                     <p className="text-sm text-slate-600 dark:text-slate-400">
-                      按“年份 + 口径”统计：支持秋升春、寒升春、秋寒升春、暑升秋。
+                      按“年份 + 口径”统计：支持秋升春、寒升春、秋寒升春、暑升秋、春暑升秋。
                     </p>
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                       <div className="space-y-2">
@@ -2284,6 +2386,7 @@ export default function Home() {
                             <SelectItem value="winter_to_spring">寒升春</SelectItem>
                             <SelectItem value="autumn_winter_to_spring">秋寒升春</SelectItem>
                             <SelectItem value="summer_to_autumn">暑升秋</SelectItem>
+                            <SelectItem value="spring_summer_to_autumn">春暑升秋</SelectItem>
                           </SelectContent>
                         </Select>
                       </div>
@@ -2292,6 +2395,30 @@ export default function Home() {
                       当前口径使用源：{effectivePlanTerms.fromTerms.length ? effectivePlanTerms.fromTerms.join('、') : '—'}；
                       目标：{effectivePlanTerms.toTerms.length ? effectivePlanTerms.toTerms.join('、') : '—'}
                     </p>
+                    {statPlan === 'autumn_winter_to_spring' && (
+                      <p className="text-xs text-slate-600 dark:text-slate-400 leading-relaxed">
+                        <strong>秋寒升春</strong>（同一学年）：选统计年 <strong>{statYear}</strong> 时，统计对象为在{' '}
+                        <strong>{statYear}秋</strong> 与 <strong>{nextYearToken(statYear)}寒</strong> 两阶段<strong>均满足有效规则</strong>
+                        的学生（仅秋或仅寒不计入分母）；目标为 <strong>{nextYearToken(statYear)}春</strong>。各年级展示为「秋+寒联合」一条进度。
+                      </p>
+                    )}
+                    {statPlan === 'spring_summer_to_autumn' && (
+                      <p className="text-xs text-slate-600 dark:text-slate-400 leading-relaxed">
+                        <strong>春暑升秋</strong>（同一学年）：选统计年 <strong>{statYear}</strong> 时，统计对象为在{' '}
+                        <strong>{statYear}春</strong> 与 <strong>{statYear}暑</strong> 两阶段<strong>均满足有效规则</strong>
+                        的学生；目标为 <strong>{statYear}秋</strong>。各年级展示为「春+暑联合」一条进度。
+                      </p>
+                    )}
+                    {statPlan === 'summer_to_autumn' && (
+                      <p className="text-xs text-slate-600 dark:text-slate-400 leading-relaxed">
+                        <strong>暑升秋</strong>：源为 <strong>{statYear}暑</strong>，目标为 <strong>{statYear}秋</strong>（同年）。
+                      </p>
+                    )}
+                    {statPlan === 'autumn_to_spring' && (
+                      <p className="text-xs text-slate-600 dark:text-slate-400 leading-relaxed">
+                        <strong>秋升春</strong>：源为 <strong>{statYear}秋</strong>，目标为 <strong>{nextYearToken(statYear)}春</strong>。
+                      </p>
+                    )}
                     {effectivePlanTerms.autoDowngraded ? (
                       <p className="text-xs text-amber-700 dark:text-amber-400">未检测到秋季源班，已自动切换为“寒升春”口径。</p>
                     ) : null}
@@ -2389,6 +2516,11 @@ export default function Home() {
                           <span className="font-medium text-sky-600">{result.new_students ?? result.new_student_details?.length ?? 0}</span>
                         </div>
                       </div>
+                      {(result.returnee_renewed_count ?? 0) > 0 && (
+                        <p className="text-xs text-center text-slate-600 dark:text-slate-400 mt-3">
+                          含退费/退班后新学期回流 <strong>{result.returnee_renewed_count}</strong> 人（已计入续读）；续班率可能超过 100%。
+                        </p>
+                      )}
                     </div>
 
                     {/* 按年级汇总 */}
@@ -2591,6 +2723,7 @@ export default function Home() {
                                   <TableHead>姓名</TableHead>
                                   <TableHead>源班级</TableHead>
                                   <TableHead>续读班级</TableHead>
+                                  <TableHead className="text-center">类型</TableHead>
                                   <TableHead className="text-center">已上课时</TableHead>
                                   <TableHead className="text-center">总课时</TableHead>
                                   <TableHead className="text-center">出勤率</TableHead>
@@ -2598,17 +2731,26 @@ export default function Home() {
                               </TableHeader>
                               <TableBody>
                                 {filteredRenewedDetails.map((student, index) => (
-                                  <TableRow key={student.student_id}>
+                                  <TableRow key={`${student.student_id}-${index}`}>
                                     <TableCell>{index + 1}</TableCell>
                                     <TableCell className="font-medium">{student.name}</TableCell>
                                     <TableCell>{student.class_name}</TableCell>
                                     <TableCell className="text-sm max-w-[200px] break-words">
                                       {student.renewed_to_class || '—'}
                                     </TableCell>
+                                    <TableCell className="text-center text-sm">
+                                      {student.returnee_after_withdraw ? (
+                                        <Badge variant="outline" className="font-normal">
+                                          退费后再读
+                                        </Badge>
+                                      ) : (
+                                        <span className="text-slate-500">正常续读</span>
+                                      )}
+                                    </TableCell>
                                     <TableCell className="text-center">{student.lessons_attended}</TableCell>
                                     <TableCell className="text-center">{student.total_lessons}</TableCell>
                                     <TableCell className="text-center">
-                                      {((student.lessons_attended / student.total_lessons) * 100).toFixed(0)}%
+                                      {((student.lessons_attended / Math.max(1, student.total_lessons)) * 100).toFixed(0)}%
                                     </TableCell>
                                   </TableRow>
                                 ))}
@@ -2725,7 +2867,12 @@ export default function Home() {
                             导出 CSV
                           </Button>
                         </div>
-                        <p className="text-sm text-slate-500 mb-2">可按目标班级/目标年级筛选后导出。</p>
+                        <p className="text-sm text-slate-500 mb-2">
+                          可按目标班级/目标年级筛选后导出。名单状态依据目标学期点名备注：半免、退费类关键词（与上传规则一致）、其余为正常。
+                          <span className="block mt-1 text-slate-600 dark:text-slate-400">
+                            「纯新生」与续班率<strong>统计口径无关</strong>：全库已上传点名册中，该生曾在<strong>本次统计所选目标班级以外</strong>的任一班级出现过，即不算新生；名单范围仍由当前统计的目标班级决定。
+                          </span>
+                        </p>
                         <div className="flex flex-wrap gap-3 mb-3">
                           <div className="flex flex-col gap-1 min-w-[200px]">
                             <span className="text-xs text-slate-500">目标班级（目标学年）</span>
@@ -2770,6 +2917,7 @@ export default function Home() {
                                   <TableHead>序号</TableHead>
                                   <TableHead>姓名</TableHead>
                                   <TableHead>目标班级</TableHead>
+                                  <TableHead className="text-center">名单状态</TableHead>
                                   <TableHead className="text-center">已上课时</TableHead>
                                   <TableHead className="text-center">总课时</TableHead>
                                   <TableHead className="text-center">出勤率</TableHead>
@@ -2781,10 +2929,17 @@ export default function Home() {
                                     <TableCell>{index + 1}</TableCell>
                                     <TableCell className="font-medium">{student.name}</TableCell>
                                     <TableCell>{student.class_name}</TableCell>
+                                    <TableCell className="text-center">
+                                      {student.enrollment_status ?? '正常'}
+                                    </TableCell>
                                     <TableCell className="text-center">{student.lessons_attended}</TableCell>
                                     <TableCell className="text-center">{student.total_lessons}</TableCell>
                                     <TableCell className="text-center">
-                                      {((student.lessons_attended / student.total_lessons) * 100).toFixed(0)}%
+                                      {(
+                                        (student.lessons_attended / Math.max(1, student.total_lessons)) *
+                                        100
+                                      ).toFixed(0)}
+                                      %
                                     </TableCell>
                                   </TableRow>
                                 ))}
@@ -3121,6 +3276,11 @@ export default function Home() {
                         <div className="text-sm text-slate-500">新生人数</div>
                       </div>
                     </div>
+                    {(result.returnee_renewed_count ?? 0) > 0 && (
+                      <p className="text-xs text-center text-slate-600 dark:text-slate-400 mt-3">
+                        含退费/退班后新学期回流 <strong>{result.returnee_renewed_count}</strong> 人（已计入续读）；续班率可能超过 100%。
+                      </p>
+                    )}
 
                     {gradeSummary.length > 0 && (
                       <div>
@@ -3142,7 +3302,7 @@ export default function Home() {
                                   {g.renewal_rate}
                                 </Badge>
                               </div>
-                              <Progress value={parseFloat(g.renewal_rate)} className="h-2 mb-2" />
+                              <Progress value={Math.min(100, parseFloat(g.renewal_rate))} className="h-2 mb-2" />
                               <div className="text-xs text-slate-500 flex justify-between">
                                 <span>{g.class_count} 个班</span>
                                 <span>有效 {g.valid_students}</span>

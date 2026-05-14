@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getSupabaseClient } from '@/storage/database/supabase-client';
 import { effectiveRowTotalLessons } from '@/lib/roster-columns';
+import { isWithdrawalRemark } from '@/lib/withdraw-remark';
 
 // 获取班级详情和所有学生
 export async function GET(
@@ -39,11 +40,13 @@ export async function GET(
       const oneThird = Math.ceil(displayTotal / 3);
       const lessonsAttended = Math.min(record.lessons_attended, displayTotal);
       const isExcludedByAttendance = lessonsAttended < oneThird;
-      const isExcluded = record.is_half_free || isExcludedByAttendance;
+      const rawRemarkStored = String(row.remark || '').trim();
+      const isWithdraw = isWithdrawalRemark(rawRemarkStored);
+      const isExcluded = record.is_half_free || isExcludedByAttendance || isWithdraw;
       let remark = '';
       const isFullFreeDb = !!(row.is_full_free ?? false);
       if (record.is_half_free) {
-        const rawRemark = String(row.remark || '').trim();
+        const rawRemark = rawRemarkStored;
         const isFreeLike =
           isFullFreeDb ||
           rawRemark.includes('免费') ||
@@ -51,6 +54,8 @@ export async function GET(
           rawRemark.includes('免学费') ||
           rawRemark.includes('减免');
         remark = isFreeLike ? '免费' : '半免';
+      } else if (isWithdraw) {
+        remark = '退费/退班';
       } else if (lessonsAttended === 0) {
         remark = '退费/退班';
       } else if (isExcludedByAttendance) {

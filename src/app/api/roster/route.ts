@@ -183,16 +183,22 @@ export async function POST(request: NextRequest) {
       };
 
       const sheetVal = student.sheet_total_lessons ?? null;
-      const insertAttempts = [
-        { ...baseRow, remark: remarkPayload, is_full_free: fullFreePayload, sheet_total_lessons: sheetVal },
+      // 有按行总课时时：先尽量带 sheet_total_lessons 插入，避免为兼容缺列而退回无 sheet 的成功插入导致数据丢失
+      const insertAttempts: Record<string, unknown>[] = [];
+      if (sheetVal != null) {
+        insertAttempts.push(
+          { ...baseRow, remark: remarkPayload, is_full_free: fullFreePayload, sheet_total_lessons: sheetVal },
+          { ...baseRow, remark: remarkPayload, sheet_total_lessons: sheetVal },
+          { ...baseRow, is_full_free: fullFreePayload, sheet_total_lessons: sheetVal },
+          { ...baseRow, sheet_total_lessons: sheetVal }
+        );
+      }
+      insertAttempts.push(
         { ...baseRow, remark: remarkPayload, is_full_free: fullFreePayload },
-        { ...baseRow, remark: remarkPayload, sheet_total_lessons: sheetVal },
         { ...baseRow, remark: remarkPayload },
-        { ...baseRow, is_full_free: fullFreePayload, sheet_total_lessons: sheetVal },
         { ...baseRow, is_full_free: fullFreePayload },
-        { ...baseRow, sheet_total_lessons: sheetVal },
-        baseRow,
-      ];
+        baseRow
+      );
 
       let recordResult = await supabase.from('attendance_records').insert(insertAttempts[0]);
       let attemptIdx = 0;
@@ -390,10 +396,7 @@ function parseRosterData(
     const remarkDesignated = remarkValue && remarkValue.trim() ? remarkValue.trim() : '';
     const remarkForStorage = remarkDesignated || combinedNotes.trim().slice(0, 255) || null;
     const isWithdrawLike = flags.isWithdrawLike && !flags.isHalfFree;
-    // 退费/退学类学生按业务应排除，且不应显示为“半免”。
-    if (isWithdrawLike) {
-      lessonsAttended = 0;
-    }
+    // 退费/退班类仍保存表格中的已上课时，便于核对；排除逻辑见备注关键词 isWithdrawalRemark
 
     let sheetTotalLessons: number | null = null;
     if (totalLessonsColumnIndex >= 0 && totalLessonsColumnIndex < row.length) {

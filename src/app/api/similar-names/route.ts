@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getSupabaseClient } from '@/storage/database/supabase-client';
 import { effectiveRowTotalLessons } from '@/lib/roster-columns';
+import { isWithdrawalRemark } from '@/lib/withdraw-remark';
 
 function joinStudentName(students: { name?: string } | { name?: string }[] | null | undefined): string {
   if (!students) return '未知';
@@ -109,6 +110,7 @@ export async function POST(request: NextRequest) {
       );
       const oneThird = Math.ceil(eff / 3);
       if (record.is_half_free) continue;
+      if (isWithdrawalRemark((record as { remark?: string | null }).remark)) continue;
       if (Math.min(record.lessons_attended, eff) < oneThird) continue;
       
       validSourceStudents.set(record.student_id, {
